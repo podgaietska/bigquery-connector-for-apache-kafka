@@ -403,6 +403,7 @@ public abstract class StorageWriteApiBase {
    */
   private JsonStreamWriterFactory getJsonStreamWriterFactory() {
     return (streamName) -> JsonStreamWriter.newBuilder(streamName, getWriteClient())
+            .setEnableConnectionPool(true)
             .build();
   }
 
