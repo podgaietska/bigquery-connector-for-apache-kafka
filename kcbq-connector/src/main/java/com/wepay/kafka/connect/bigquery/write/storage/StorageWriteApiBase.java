@@ -28,6 +28,7 @@ import com.google.cloud.bigquery.storage.v1.AppendRowsResponse;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteClient;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteSettings;
 import com.google.cloud.bigquery.storage.v1.Exceptions;
+import com.google.cloud.bigquery.storage.v1.JsonStreamWriter;
 import com.google.cloud.bigquery.storage.v1.RowError;
 import com.google.cloud.bigquery.storage.v1.TableName;
 import com.google.common.annotations.VisibleForTesting;
@@ -62,6 +63,7 @@ public abstract class StorageWriteApiBase {
   private final boolean autoCreateTables;
   private final BigQueryWriteSettings writeSettings;
   private final boolean attemptSchemaUpdate;
+  protected final JsonStreamWriterFactory jsonWriterFactory;
   protected SchemaManager schemaManager;
   @VisibleForTesting
   protected Time time;
@@ -89,6 +91,7 @@ public abstract class StorageWriteApiBase {
     this.errantRecordHandler = errantRecordHandler;
     this.schemaManager = schemaManager;
     this.attemptSchemaUpdate = attemptSchemaUpdate;
+    this.jsonWriterFactory = getJsonStreamWriterFactory();
     try {
       this.writeClient = getWriteClient();
     } catch (IOException e) {
@@ -391,6 +394,16 @@ public abstract class StorageWriteApiBase {
       logger.warn("DLQ is not configured!");
       throw new BigQueryStorageWriteApiConnectException(tableName, errorMap);
     }
+  }
+
+  /**
+   * Returns a {@link JsonStreamWriterFactory} for creating configured {@link JsonStreamWriter} instances
+   *
+   * @return a {@link JsonStreamWriterFactory}.
+   */
+  private JsonStreamWriterFactory getJsonStreamWriterFactory() {
+    return (streamName) -> JsonStreamWriter.newBuilder(streamName, getWriteClient())
+            .build();
   }
 
   private JSONArray getJsonRecords(List<ConvertedRecord> rows) {
