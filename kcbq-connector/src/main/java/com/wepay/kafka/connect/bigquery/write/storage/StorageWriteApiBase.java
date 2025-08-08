@@ -303,8 +303,10 @@ public abstract class StorageWriteApiBase {
    *
    * @return a {@link JsonStreamWriterFactory}.
    */
-  protected JsonStreamWriterFactory getJsonStreamWriterFactory() {
-    return (streamName) -> JsonStreamWriter.newBuilder(streamName, writeClient).build();
+  protected JsonStreamWriterFactory getJsonStreamWriterFactory(boolean multiplexingEnabled) {
+    return (streamName) -> JsonStreamWriter.newBuilder(streamName, writeClient)
+            .setEnableConnectionPool(multiplexingEnabled)
+            .build();
   }
 
   /**

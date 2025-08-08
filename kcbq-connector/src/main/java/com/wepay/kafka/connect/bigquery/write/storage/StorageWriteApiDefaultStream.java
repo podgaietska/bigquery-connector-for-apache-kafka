@@ -65,7 +65,7 @@ public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
         schemaManager,
         attemptSchemaUpdate
     );
-    jsonStreamWriterFactory = getJsonStreamWriterFactory();
+    jsonStreamWriterFactory = getJsonStreamWriterFactory(/* multiplexingEnabled= */ true);
   }
 
   @Override

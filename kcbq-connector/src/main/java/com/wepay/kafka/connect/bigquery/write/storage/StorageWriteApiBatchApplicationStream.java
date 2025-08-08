@@ -101,7 +101,7 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
     currentStreams = new ConcurrentHashMap<>();
     tableLocks = new ConcurrentHashMap<>();
     streamLocks = new ConcurrentHashMap<>();
-    jsonStreamWriterFactory = getJsonStreamWriterFactory();
+    jsonStreamWriterFactory = getJsonStreamWriterFactory(/* multiplexingEnabled= */ false);
   }
 
   /**
