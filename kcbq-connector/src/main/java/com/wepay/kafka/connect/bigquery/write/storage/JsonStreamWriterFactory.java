@@ -32,6 +32,6 @@ import java.io.IOException;
  */
 @FunctionalInterface
 public interface JsonStreamWriterFactory {
-  JsonStreamWriter create(String streamName) throws Descriptors.DescriptorValidationException, IOException,
-        InterruptedException;
+  JsonStreamWriter create(String streamOrTableName) throws Descriptors.DescriptorValidationException,
+        IOException, InterruptedException;
 }

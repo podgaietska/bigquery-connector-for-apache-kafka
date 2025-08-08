@@ -63,7 +63,6 @@ public abstract class StorageWriteApiBase {
   private final boolean autoCreateTables;
   private final BigQueryWriteSettings writeSettings;
   private final boolean attemptSchemaUpdate;
-  protected final JsonStreamWriterFactory jsonWriterFactory;
   protected SchemaManager schemaManager;
   @VisibleForTesting
   protected Time time;
@@ -91,7 +90,6 @@ public abstract class StorageWriteApiBase {
     this.errantRecordHandler = errantRecordHandler;
     this.schemaManager = schemaManager;
     this.attemptSchemaUpdate = attemptSchemaUpdate;
-    this.jsonWriterFactory = getJsonStreamWriterFactory();
     try {
       this.writeClient = getWriteClient();
     } catch (IOException e) {
@@ -301,6 +299,17 @@ public abstract class StorageWriteApiBase {
   }
 
   /**
+   * Returns a {@link JsonStreamWriterFactory} for creating configured {@link JsonStreamWriter} instances
+   *
+   * @return a {@link JsonStreamWriterFactory}.
+   */
+  protected JsonStreamWriterFactory getJsonStreamWriterFactory(boolean multiplexingEnabled) {
+    return (streamName) -> JsonStreamWriter.newBuilder(streamName, writeClient)
+            .setEnableConnectionPool(multiplexingEnabled)
+            .build();
+  }
+
+  /**
    * Verifies the exception object and returns row-wise error map
    *
    * @param exception if the exception is not of expected type
@@ -394,17 +403,6 @@ public abstract class StorageWriteApiBase {
       logger.warn("DLQ is not configured!");
       throw new BigQueryStorageWriteApiConnectException(tableName, errorMap);
     }
-  }
-
-  /**
-   * Returns a {@link JsonStreamWriterFactory} for creating configured {@link JsonStreamWriter} instances
-   *
-   * @return a {@link JsonStreamWriterFactory}.
-   */
-  private JsonStreamWriterFactory getJsonStreamWriterFactory() {
-    return (streamName) -> JsonStreamWriter.newBuilder(streamName, getWriteClient())
-            .setEnableConnectionPool(true)
-            .build();
   }
 
   private JSONArray getJsonRecords(List<ConvertedRecord> rows) {

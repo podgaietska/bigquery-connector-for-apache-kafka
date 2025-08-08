@@ -46,6 +46,7 @@ import org.slf4j.LoggerFactory;
  */
 public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
   private static final Logger logger = LoggerFactory.getLogger(StorageWriteApiDefaultStream.class);
+  private final JsonStreamWriterFactory jsonStreamWriterFactory;
   ConcurrentMap<String, JsonStreamWriter> tableToStream = new ConcurrentHashMap<>();
 
   public StorageWriteApiDefaultStream(int retry,
@@ -64,6 +65,7 @@ public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
         schemaManager,
         attemptSchemaUpdate
     );
+    jsonStreamWriterFactory = getJsonStreamWriterFactory(/* multiplexingEnabled= */ true);
   }
 
   @Override
@@ -104,7 +106,7 @@ public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
       StorageWriteApiRetryHandler retryHandler = new StorageWriteApiRetryHandler(table, getSinkRecords(rows), retry, retryWait, time);
       do {
         try {
-          return jsonWriterFactory.create(tableName);
+          return jsonStreamWriterFactory.create(tableName);
         } catch (Exception e) {
           String baseErrorMessage = String.format(
               "Failed to create Default stream writer on table %s due to %s",
