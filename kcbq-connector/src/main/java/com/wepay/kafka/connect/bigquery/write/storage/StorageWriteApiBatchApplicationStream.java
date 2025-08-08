@@ -61,6 +61,7 @@ import org.slf4j.LoggerFactory;
 public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
 
   private static final Logger logger = LoggerFactory.getLogger(StorageWriteApiBatchApplicationStream.class);
+  private final JsonStreamWriterFactory jsonStreamWriterFactory;
 
   /**
    * Map of {tableName , {StreamName, {@link ApplicationStream}}}
@@ -100,6 +101,7 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
     currentStreams = new ConcurrentHashMap<>();
     tableLocks = new ConcurrentHashMap<>();
     streamLocks = new ConcurrentHashMap<>();
+    jsonStreamWriterFactory = getJsonStreamWriterFactory();
   }
 
   /**
@@ -237,7 +239,7 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
         TableName.parse(tableName), rows != null ? getSinkRecords(rows) : null, retry, retryWait, time);
     do {
       try {
-        return new ApplicationStream(tableName, getWriteClient());
+        return new ApplicationStream(tableName, getWriteClient(), jsonStreamWriterFactory);
       } catch (Exception e) {
         String baseErrorMessage = String.format(
             "Failed to create Application stream writer on table %s due to %s",

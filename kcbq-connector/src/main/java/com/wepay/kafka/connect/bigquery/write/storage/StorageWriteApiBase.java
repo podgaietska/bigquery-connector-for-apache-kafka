@@ -28,6 +28,7 @@ import com.google.cloud.bigquery.storage.v1.AppendRowsResponse;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteClient;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteSettings;
 import com.google.cloud.bigquery.storage.v1.Exceptions;
+import com.google.cloud.bigquery.storage.v1.JsonStreamWriter;
 import com.google.cloud.bigquery.storage.v1.RowError;
 import com.google.cloud.bigquery.storage.v1.TableName;
 import com.google.common.annotations.VisibleForTesting;
@@ -295,6 +296,15 @@ public abstract class StorageWriteApiBase {
       this.writeClient = BigQueryWriteClient.create(writeSettings);
     }
     return this.writeClient;
+  }
+
+  /**
+   * Returns a {@link JsonStreamWriterFactory} for creating configured {@link JsonStreamWriter} instances
+   *
+   * @return a {@link JsonStreamWriterFactory}.
+   */
+  protected JsonStreamWriterFactory getJsonStreamWriterFactory() {
+    return (streamName) -> JsonStreamWriter.newBuilder(streamName, writeClient).build();
   }
 
   /**
