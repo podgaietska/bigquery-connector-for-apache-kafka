@@ -63,6 +63,7 @@ public abstract class StorageWriteApiBase {
   protected final int retry;
   protected final long retryWait;
   private final boolean autoCreateTables;
+  private final boolean ignoreUnknownFields;
   private final BigQueryWriteSettings writeSettings;
   private final boolean attemptSchemaUpdate;
   protected SchemaManager schemaManager;
@@ -77,6 +78,7 @@ public abstract class StorageWriteApiBase {
    * @param writeSettings       Write Settings for stream which carry authentication and other header information
    * @param autoCreateTables    boolean flag set if table should be created automatically
    * @param errantRecordHandler Used to handle errant records
+   * @param ignoreUnknownFields whether to ignore fields in records that are not defined in target BQ table schema
    */
   protected StorageWriteApiBase(int retry,
                                 long retryWait,
@@ -84,7 +86,8 @@ public abstract class StorageWriteApiBase {
                                 boolean autoCreateTables,
                                 ErrantRecordHandler errantRecordHandler,
                                 SchemaManager schemaManager,
-                                boolean attemptSchemaUpdate) {
+                                boolean attemptSchemaUpdate,
+                                boolean ignoreUnknownFields) {
     this.retry = retry;
     this.retryWait = retryWait;
     this.autoCreateTables = autoCreateTables;
@@ -92,6 +95,7 @@ public abstract class StorageWriteApiBase {
     this.errantRecordHandler = errantRecordHandler;
     this.schemaManager = schemaManager;
     this.attemptSchemaUpdate = attemptSchemaUpdate;
+    this.ignoreUnknownFields = ignoreUnknownFields;
     try {
       this.writeClient = getWriteClient();
     } catch (IOException e) {
@@ -309,6 +313,7 @@ public abstract class StorageWriteApiBase {
             .build();
     return streamOrTableName -> JsonStreamWriter.newBuilder(streamOrTableName, writeClient)
             .setRetrySettings(retrySettings)
+            .setIgnoreUnknownFields(ignoreUnknownFields)
             .build();
   }
 

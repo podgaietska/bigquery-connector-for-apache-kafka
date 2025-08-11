@@ -36,14 +36,11 @@ import com.wepay.kafka.connect.bigquery.retrieve.IdentitySchemaRetriever;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -169,6 +166,8 @@ public class BigQuerySinkConfig extends AbstractConfig {
   public static final String MAX_RETRIES_CONFIG = "max.retries";
   public static final String ENABLE_RETRIES_CONFIG = "enableRetries";
   public static final Boolean ENABLE_RETRIES_DEFAULT = true;
+  public static final String IGNORE_UNKNOWN_FIELDS_CONFIG = "ignoreUnknownFields";
+  public static final Boolean IGNORE_UNKNOWN_FIELDS_DEFAULT = false;
   private static final ConfigDef.Type TOPICS_TYPE = ConfigDef.Type.LIST;
   private static final ConfigDef.Importance TOPICS_IMPORTANCE = ConfigDef.Importance.HIGH;
   private static final String TOPICS_GROUP = "Common";
@@ -539,6 +538,11 @@ public class BigQuerySinkConfig extends AbstractConfig {
   private static final String MAX_RETRIES_DOC = "The maximum number of times to retry on retriable errors before failing the task.";
   private static final ConfigDef.Type ENABLE_RETRIES_TYPE = ConfigDef.Type.BOOLEAN;
   private static final ConfigDef.Importance ENABLE_RETRIES_IMPORTANCE = ConfigDef.Importance.MEDIUM;
+  private static final ConfigDef.Type IGNORE_UNKNOWN_FIELDS_TYPE = ConfigDef.Type.BOOLEAN;
+  private static final ConfigDef.Importance IGNORE_UNKNOWN_FIELDS_IMPORTANCE = ConfigDef.Importance.LOW;
+  private static final String IGNORE_UNKNOWN_FIELDS_DOC = "Whether to allow records with fields that are not present in " +
+          "the BigQuery table schema. When enabled, these unknown fields will be silently ignored during ingestion" +
+          " instead of causing the record to be rejected.\n";
   private static final List<MultiPropertyValidator<BigQuerySinkConfig>> MULTI_PROPERTY_VALIDATIONS = new ArrayList<>();
 
   static {
@@ -905,6 +909,12 @@ public class BigQuerySinkConfig extends AbstractConfig {
             MAX_RETRIES_VALIDATOR,
             MAX_RETRIES_IMPORTANCE,
             MAX_RETRIES_DOC
+        ).define(
+            IGNORE_UNKNOWN_FIELDS_CONFIG,
+            IGNORE_UNKNOWN_FIELDS_TYPE,
+            IGNORE_UNKNOWN_FIELDS_DEFAULT,
+            IGNORE_UNKNOWN_FIELDS_IMPORTANCE,
+            IGNORE_UNKNOWN_FIELDS_DOC
         ).defineInternal(
             ENABLE_RETRIES_CONFIG,
             ENABLE_RETRIES_TYPE,
