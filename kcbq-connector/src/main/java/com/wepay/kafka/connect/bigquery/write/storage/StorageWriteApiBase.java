@@ -307,9 +307,19 @@ public abstract class StorageWriteApiBase {
             .setInitialRetryDelay(Duration.ofMillis(retryWait))
             .setMaxRetryDelay(Duration.ofMillis(retryWait))
             .build();
-    return streamOrTableName -> JsonStreamWriter.newBuilder(streamOrTableName, writeClient)
-            .setRetrySettings(retrySettings)
-            .build();
+    return streamOrTableName -> {
+      JsonStreamWriter.Builder builder = JsonStreamWriter.newBuilder(streamOrTableName, writeClient)
+              .setRetrySettings(retrySettings);
+      applyJsonWriterConfig(builder);
+      return builder.build();
+    };
+  }
+
+  /**
+   * Override to provide additional configs to JsonStreamWriter
+   */
+  protected void applyJsonWriterConfig(JsonStreamWriter.Builder builder) {
+    // no-op default
   }
 
   /**
