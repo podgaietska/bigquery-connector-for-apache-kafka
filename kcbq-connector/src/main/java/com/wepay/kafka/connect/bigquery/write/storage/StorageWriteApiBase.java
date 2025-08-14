@@ -24,6 +24,7 @@
 package com.wepay.kafka.connect.bigquery.write.storage;
 
 import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutures;
 import com.google.cloud.bigquery.storage.v1.AppendRowsResponse;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteClient;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteSettings;
@@ -31,6 +32,7 @@ import com.google.cloud.bigquery.storage.v1.Exceptions;
 import com.google.cloud.bigquery.storage.v1.RowError;
 import com.google.cloud.bigquery.storage.v1.TableName;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.protobuf.Descriptors;
 import com.google.rpc.Status;
 import com.wepay.kafka.connect.bigquery.ErrantRecordHandler;
 import com.wepay.kafka.connect.bigquery.SchemaManager;
@@ -45,6 +47,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executor;
 import java.util.stream.Collectors;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.json.JSONArray;
@@ -237,6 +240,174 @@ public abstract class StorageWriteApiBase {
       }
       throw new RetryException(errorMessage);
     }
+  }
+
+  protected ApiFuture<Void> asyncInitializeAndWriteRecords(
+          TableName tableName,
+          List<ConvertedRecord> rows,
+          String streamName,
+          Executor callbackExec
+  ) {
+    StorageWriteApiRetryHandler retryHandler = new StorageWriteApiRetryHandler(tableName, getSinkRecords(rows), retry, retryWait, time);
+    logger.debug("Sending {} records to write Api Application stream {}", rows.size(), streamName);
+    RecordBatches<ConvertedRecord> batches = new RecordBatches<>(rows);
+    StreamWriter writer = streamWriter(tableName, streamName, rows);
+    ApiFuture<AppendRowsResponse> f;
+    try {
+      List<ConvertedRecord> batch = batches.currentBatch();
+      // One call is enough; writeBatchAsync handles message-too-large splitting,
+      // malformed-row DLQ filtering, schema/table updates, and retries.
+      f = writeBatchAsync(writer, batch, retryHandler, tableName, callbackExec);
+    } catch (IOException e) {
+      // Surface fatal construction errors as a failed future.
+      return ApiFutures.immediateFailedFuture(e);
+    } catch (Descriptors.DescriptorValidationException e) {
+      throw new RuntimeException(e);
+    }
+
+    // Map the response to Void and call writer.onSuccess() at the very end.
+    return ApiFutures.transform(
+            f,
+            ignored -> {
+              try {
+                writer.onSuccess();   // batch mode may finalize/commit; default is no-op
+              } catch (RuntimeException rte) {
+                // preserve any onSuccess failure
+                throw rte;
+              }
+              return null;
+            },
+            callbackExec
+    );
+  }
+
+  protected ApiFuture<AppendRowsResponse> writeBatchAsync(
+          StreamWriter writer,
+          List<ConvertedRecord> batch,
+          StorageWriteApiRetryHandler retryHandler,
+          TableName tableName,
+          Executor callbackExec
+  ) throws Descriptors.DescriptorValidationException, IOException {
+    JSONArray jsonRecords = getJsonRecords(batch);
+    ApiFuture<AppendRowsResponse> rpc = writer.appendRows(jsonRecords);
+
+    // 1) Handle *successful RPC completion* (response came back)
+    ApiFuture<AppendRowsResponse> handledResponse =
+            ApiFutures.transformAsync(
+                    rpc,
+                    resp -> {
+                      if (resp.hasUpdatedSchema()) {
+                        if (!canAttemptSchemaUpdate()) {
+                          return ApiFutures.immediateFailedFuture(
+                                  new BigQueryStorageWriteApiConnectException(
+                                          "Connector is not configured to perform schema updates."));
+                        }
+                        retryHandler.attemptTableOperation(schemaManager::updateSchema);
+                        retryHandler.maybeRetry("write to table " + tableName);
+                        return writeBatchAsync(writer, batch, retryHandler, tableName, callbackExec);
+                      }
+                      if (resp.hasError()) {
+                        String msg = resp.getError().getMessage();
+                        retryHandler.setMostRecentException(
+                                new BigQueryStorageWriteApiConnectException(
+                                        "Failed to write rows on table " + tableName + " due to " + msg));
+
+                        if (BigQueryStorageWriteApiErrorResponses.isMalformedRequest(msg)) {
+                          Map<Integer, String> rowErrs = convertToMap(resp.getRowErrorsList());
+                          List<ConvertedRecord> filtered =
+                                  maybeHandleDlqRoutingAndFilterRecords(batch, rowErrs, tableName.getTable());
+                          if (filtered.isEmpty()) {
+                            return ApiFutures.immediateFuture(resp);
+                          }
+                          retryHandler.maybeRetry("write to table " + tableName);
+                          return writeBatchAsync(writer, filtered, retryHandler, tableName, callbackExec);
+                        }
+
+                        if (!BigQueryStorageWriteApiErrorResponses.isRetriableError(msg)) {
+                          failTask(retryHandler.getMostRecentException());
+                          return ApiFutures.immediateFailedFuture(retryHandler.getMostRecentException());
+                        }
+                        retryHandler.maybeRetry("write to table " + tableName);
+                        return writeBatchAsync(writer, batch, retryHandler, tableName, callbackExec);
+                      }
+                      return ApiFutures.immediateFuture(resp);
+                    },
+                    callbackExec
+            );
+
+    // 2) Handle *RPC failure path* (exceptions, message too large, stream closed, table missing, schema mismatch)
+    return ApiFutures.catchingAsync(
+            handledResponse,
+            Throwable.class,
+            t -> {
+              Throwable e = (t instanceof java.util.concurrent.ExecutionException && t.getCause() != null) ? t.getCause() : t;
+              String msg = e.getMessage() == null ? e.toString() : e.getMessage();
+              retryHandler.setMostRecentException(
+                      new BigQueryStorageWriteApiConnectException(
+                              "Failed to write rows on table " + tableName + " due to " + msg, e));
+
+              if (BigQueryStorageWriteApiErrorResponses.isStreamClosed(msg)) {
+                writer.refresh();
+                retryHandler.maybeRetry("write to table " + tableName);
+                return writeBatchAsync(writer, batch, retryHandler, tableName, callbackExec);
+              }
+
+              if (shouldHandleSchemaMismatch(new RuntimeException(msg))) {
+                retryHandler.attemptTableOperation(schemaManager::updateSchema);
+                retryHandler.maybeRetry("write to table " + tableName);
+                return writeBatchAsync(writer, batch, retryHandler, tableName, callbackExec);
+              }
+
+              if (BigQueryStorageWriteApiErrorResponses.isMessageTooLargeError(msg)) {
+                if (batch.size() <= 1) {
+                  Map<Integer, String> rowErr = java.util.Collections.singletonMap(0, msg);
+                  List<ConvertedRecord> filtered =
+                          maybeHandleDlqRoutingAndFilterRecords(batch, rowErr, tableName.getTable());
+                  if (filtered.isEmpty()) {
+                    return ApiFutures.immediateFuture(null);
+                  }
+                  retryHandler.maybeRetry("write to table " + tableName);
+                  return writeBatchAsync(writer, filtered, retryHandler, tableName, callbackExec);
+                } else {
+                  int mid = batch.size() / 2;
+                  List<ConvertedRecord> left = batch.subList(0, mid);
+                  List<ConvertedRecord> right = batch.subList(mid, batch.size());
+
+                  return ApiFutures.transformAsync(
+                          writeBatchAsync(writer, left, retryHandler, tableName, callbackExec),
+                          ignored -> writeBatchAsync(writer, right, retryHandler, tableName, callbackExec),
+                          callbackExec
+                  );
+                }
+              }
+
+              if (BigQueryStorageWriteApiErrorResponses.isMalformedRequest(msg)) {
+                Map<Integer, String> rowErrs = getRowErrorMapping(new RuntimeException(msg));
+                List<ConvertedRecord> filtered =
+                        maybeHandleDlqRoutingAndFilterRecords(batch, rowErrs, tableName.getTable());
+                if (filtered.isEmpty()) {
+                  return ApiFutures.immediateFuture(null);
+                }
+                retryHandler.maybeRetry("write to table " + tableName);
+                return writeBatchAsync(writer, filtered, retryHandler, tableName, callbackExec);
+              }
+
+              if (BigQueryStorageWriteApiErrorResponses.isTableMissing(msg) && getAutoCreateTables()) {
+                retryHandler.attemptTableOperation(schemaManager::createTable);
+                retryHandler.maybeRetry("write to table " + tableName);
+                return writeBatchAsync(writer, batch, retryHandler, tableName, callbackExec);
+              }
+
+              if (isNonRetriable(new RuntimeException(msg))) {
+                failTask(retryHandler.getMostRecentException());
+                return ApiFutures.immediateFailedFuture(retryHandler.getMostRecentException());
+              }
+
+              retryHandler.maybeRetry("write to table " + tableName);
+              return writeBatchAsync(writer, batch, retryHandler, tableName, callbackExec);
+            },
+            callbackExec
+    );
   }
 
   private abstract static class BatchWriteException extends Exception {

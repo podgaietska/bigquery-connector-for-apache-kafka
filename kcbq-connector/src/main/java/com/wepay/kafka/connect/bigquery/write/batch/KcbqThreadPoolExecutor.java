@@ -68,6 +68,15 @@ public class KcbqThreadPoolExecutor extends ThreadPoolExecutor {
   }
 
   @Override
+  protected void beforeExecute(Thread t, Runnable r) {
+    super.beforeExecute(t, r);
+    logger.info(
+            "beforeExecute thread={} active={} pool={} queueSize={}",
+            t.getName(), getActiveCount(), getPoolSize(), getQueue().size()
+    );
+  }
+
+  @Override
   protected void afterExecute(Runnable runnable, Throwable throwable) {
     super.afterExecute(runnable, throwable);
 

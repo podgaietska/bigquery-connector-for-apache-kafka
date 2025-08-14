@@ -60,11 +60,7 @@ import com.wepay.kafka.connect.bigquery.write.row.BigQueryWriter;
 import com.wepay.kafka.connect.bigquery.write.row.GcsToBqWriter;
 import com.wepay.kafka.connect.bigquery.write.row.SimpleBigQueryWriter;
 import com.wepay.kafka.connect.bigquery.write.row.UpsertDeleteBigQueryWriter;
-import com.wepay.kafka.connect.bigquery.write.storage.StorageApiBatchModeHandler;
-import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiBase;
-import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiBatchApplicationStream;
-import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiDefaultStream;
-import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiWriter;
+import com.wepay.kafka.connect.bigquery.write.storage.*;
 import io.aiven.kafka.utils.VersionInfo;
 import java.time.Instant;
 import java.util.Arrays;
@@ -76,12 +72,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
@@ -138,7 +130,8 @@ public class BigQuerySinkTask extends SinkTask {
   private int retry;
   private long retryWait;
   private Map<String, PartitionedTableId> topicToPartitionTableId;
-
+  private AsyncStorageWriteApiWriter asyncDefaultWriter;
+  private Executor callbackExec;
   private boolean allowNewBigQueryFields;
   private boolean useCredentialsProjectId;
   private boolean allowRequiredFieldRelaxation;
@@ -192,6 +185,9 @@ public class BigQuerySinkTask extends SinkTask {
 
     // Return immediately here since the executor will already be shutdown
     if (stopped) {
+      if (useStorageApi && !useStorageApiBatchMode) {
+        asyncDefaultWriter.maybeThrowFatal();   // surface background failure
+      }
       // Still have to check for errors in order to prevent offsets being committed for records that
       // we've failed to write
       executor.maybeThrowEncounteredError();
@@ -199,7 +195,16 @@ public class BigQuerySinkTask extends SinkTask {
     }
 
     try {
-      executor.awaitCurrentTasks();
+      if (useStorageApi && !useStorageApiBatchMode) {
+        // Wait until every previously submitted async write is completed
+        asyncDefaultWriter.fenceAndDrain();
+        // If anything failed, throw now to prevent committing offsets
+        asyncDefaultWriter.maybeThrowFatal();
+      } else {
+        // --- LEGACY / NON-STORAGE-API PATH ---
+        executor.awaitCurrentTasks();
+        executor.maybeThrowEncounteredError();
+      }
     } catch (InterruptedException err) {
       throw new ConnectException("Interrupted while waiting for write tasks to complete.", err);
     }
@@ -304,11 +309,10 @@ public class BigQuerySinkTask extends SinkTask {
         if (!tableWriterBuilders.containsKey(table)) {
           TableWriterBuilder tableWriterBuilder;
           if (useStorageApi) {
-            tableWriterBuilder = new StorageWriteApiWriter.Builder(
-                storageApiWriter,
-                TableNameUtils.tableName(table.getBaseTableId()),
-                recordConverter,
-                batchHandler
+            tableWriterBuilder = new AsyncStorageWriteApiWriter.Builder(
+                    TableNameUtils.tableName(table.getBaseTableId()),
+                    recordConverter,
+                    asyncDefaultWriter
             );
           } else if (config.getList(BigQuerySinkConfig.ENABLE_BATCH_CONFIG).contains(record.topic())) {
             String topic = record.topic();
@@ -389,10 +393,13 @@ public class BigQuerySinkTask extends SinkTask {
     long queueSoftLimit = config.getLong(BigQuerySinkConfig.QUEUE_SIZE_CONFIG);
     if (queueSoftLimit != -1) {
       int currentQueueSize = executor.getQueue().size();
+      logger.info("Current queue size: {}", currentQueueSize);
       if (currentQueueSize > queueSoftLimit) {
+        logger.info("Pausing partitions");
         topicPartitionManager.pauseAll();
       } else if (currentQueueSize <= queueSoftLimit / 2) {
         // resume only if there is a reasonable chance we won't immediately have to pause again.
+        logger.info("Resuming partitions");
         topicPartitionManager.resumeAll();
       }
     }
@@ -563,6 +570,7 @@ public class BigQuerySinkTask extends SinkTask {
     topicToPartitionTableId = new HashMap<>();
     bigQuery = new AtomicReference<>();
     schemaManager = new AtomicReference<>();
+    this.callbackExec = Executors.newFixedThreadPool(2);
 
     // Initialise errantRecordReporter
     ErrantRecordReporter errantRecordReporter = null;
@@ -656,6 +664,8 @@ public class BigQuerySinkTask extends SinkTask {
             getSchemaManager(),
             attemptSchemaUpdate
         );
+
+        this.asyncDefaultWriter = new AsyncStorageWriteApiWriter(storageApiWriter, callbackExec);
       }
     }
   }
@@ -672,6 +682,9 @@ public class BigQuerySinkTask extends SinkTask {
 
   private void maybeThrowErrors() {
     executor.maybeThrowEncounteredError();
+    if (useStorageApi && !useStorageApiBatchMode) {
+      asyncDefaultWriter.maybeThrowFatal();
+    }
     if (useStorageApiBatchMode && loadExecutor.isTerminated()) {
       throw new BigQueryStorageWriteApiConnectException(
           "Batch load handler is terminated, failing task as no data would be written to bigquery tables!");
@@ -773,6 +786,7 @@ public class BigQuerySinkTask extends SinkTask {
   private static class MdcContextThreadFactory implements ThreadFactory {
 
     private final Map<String, String> mdcContext;
+    private final AtomicInteger idx = new AtomicInteger(1);
 
     public MdcContextThreadFactory() {
       this.mdcContext = MDC.getCopyOfContextMap();
@@ -780,16 +794,21 @@ public class BigQuerySinkTask extends SinkTask {
 
     @Override
     public Thread newThread(Runnable runnable) {
+      String name = "t-" + idx.getAndIncrement();
+      Thread t;
       if (mdcContext == null) {
-        return new Thread(runnable);
+        t = new Thread(runnable, name);
       } else {
-        return new Thread(() -> {
+        t = new Thread(() -> {
           MDC.setContextMap(mdcContext);
           runnable.run();
-        });
+        }, name);
       }
+      return t;
     }
   }
+
+
 
   private class TopicPartitionManager {
 

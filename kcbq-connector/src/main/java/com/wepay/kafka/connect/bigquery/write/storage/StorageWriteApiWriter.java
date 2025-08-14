@@ -73,7 +73,9 @@ public class StorageWriteApiWriter implements Runnable {
       logger.debug("There are no records, skipping");
       return;
     }
-    logger.debug("Putting {} records into {} stream", records.size(), streamName);
+    final String thread = Thread.currentThread().getName();
+
+    logger.debug("Using thread {} to put {} records into {} stream", thread, records.size(), streamName);
     streamWriter.initializeAndWriteRecords(tableName, records, streamName);
   }
 
