@@ -196,12 +196,9 @@ public class BigQuerySinkTask extends SinkTask {
 
     try {
       if (useStorageApi) {
-        // Wait until every previously submitted async write is completed
-        asyncDefaultWriter.fenceAndDrain();
-        // If anything failed, throw now to prevent committing offsets
+        asyncDefaultWriter.awaitCurrentAppends();
         asyncDefaultWriter.maybeThrowFatal();
       } else {
-        // --- LEGACY / NON-STORAGE-API PATH ---
         executor.awaitCurrentTasks();
         executor.maybeThrowEncounteredError();
       }

@@ -53,7 +53,7 @@ public class AsyncStorageWriteApiWriter {
         }
     }
 
-    public void fenceAndDrain() throws InterruptedException {
+    public void awaitCurrentAppends() throws InterruptedException {
         CountDownLatch done = new CountDownLatch(1);
         executor.execute(() -> {
             try {
