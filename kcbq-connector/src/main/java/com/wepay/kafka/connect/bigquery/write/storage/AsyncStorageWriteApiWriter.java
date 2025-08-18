@@ -14,7 +14,6 @@ import org.json.JSONObject;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -36,12 +35,12 @@ public class AsyncStorageWriteApiWriter {
 
     void sendAppendRowsRequest(List<ConvertedRecord> batch, TableName tableName) {
         executor.execute(() -> {
-            harvestNonBlocking();
+            checkForFailedResponses();
 
             try {
                 ApiFuture<AppendRowsResponse> appendRowsResponseApiFuture =
                         streamWriter.asyncInitializeAndWriteRecords(tableName, batch, "default", callbackExec);
-                Map<TopicPartition, Long> maxOffsets = computeMaxOffsets(batch);
+                Map<TopicPartition, AppendRowsAttempt.OffsetRange> maxOffsets = computeOffsetRange(batch);
                 appendAttempts.add(new AppendRowsAttempt(appendRowsResponseApiFuture, maxOffsets));
 
 //                f.addListener(() -> {
@@ -85,142 +84,94 @@ public class AsyncStorageWriteApiWriter {
 //        maybeThrowFatal();
 //    }
 
-//    private void checkForFailedResponses(boolean wait) {
-//        while (!futuresQueue.isEmpty()) {
-//            ApiFuture<AppendRowsResponse> head = futuresQueue.peekFirst();
-//            if (!wait && !head.isDone()) break;
-//            try {
-//                head.get();
-//            } catch (Exception e) {
-//                fatal.compareAndSet(null, e);
-//            } finally {
-//                futuresQueue.removeFirst();
-//            }
-//        }
-//    }
-
-    public void harvestNonBlocking() {
-        for (AppendRowsAttempt a : appendAttempts) {
-            if (a.future.isDone()) {
-                try {
-                    a.future.get();
-                } catch (Exception e) {
-                    fatal.compareAndSet(null, e);
-                }
+    private void checkForFailedResponses() {
+        while (!appendAttempts.isEmpty()) {
+            AppendRowsAttempt head = appendAttempts.peek();
+            if (!head.future.isDone()) break;
+            try {
+                head.future.get();
+            } catch (Exception e) {
+                fatal.compareAndSet(null, e);
+            } finally {
+                appendAttempts.poll();
             }
         }
     }
 
-    private Map<TopicPartition, Long> computeMaxOffsets(List<ConvertedRecord> batch) {
-        Map<TopicPartition, Long> result = new HashMap<>();
+    private Map<TopicPartition,  AppendRowsAttempt.OffsetRange> computeOffsetRange(List<ConvertedRecord> batch) {
+        Map<TopicPartition,  AppendRowsAttempt.OffsetRange> result = new HashMap<>();
         for (ConvertedRecord record : batch) {
-            SinkRecord original = record.original();
-            TopicPartition topicPartition = new TopicPartition(original.topic(), original.kafkaPartition());
-            result.merge(topicPartition, original.kafkaOffset(), Math::max);
+            SinkRecord originalRecord = record.original();
+            TopicPartition topicPartition = new TopicPartition(originalRecord.topic(), originalRecord.kafkaPartition());
+            long currentOffset = originalRecord.kafkaOffset();
+            AppendRowsAttempt.OffsetRange currentOffsetRange = result.get(topicPartition);
+
+            if (currentOffsetRange == null) {
+                result.put(topicPartition, new  AppendRowsAttempt.OffsetRange(currentOffset, currentOffset));
+            } else {
+                result.put(topicPartition, new  AppendRowsAttempt.OffsetRange(
+                        Math.min(currentOffsetRange.min, currentOffset), Math.max(currentOffsetRange.max, currentOffset))
+                );
+            }
         }
         return result;
     }
 
-    public Map<TopicPartition, OffsetAndMetadata> computeSafeCommits(
+    public Map<TopicPartition, OffsetAndMetadata> getSafeToCommitOffsets(
             Map<TopicPartition, OffsetAndMetadata> offsetsToCommit) {
-        maybeThrowFatal();      // surface any failures before trying to commit
+        // check all done responses and surface any failures before proceeding with committing.
+        checkForFailedResponses();
+        maybeThrowFatal();
 
-        Map<TopicPartition, Long> safeMaxOffsetPerTp = new HashMap<>();
-        for (TopicPartition tp : offsetsToCommit.keySet()) safeMaxOffsetPerTp.put(tp, -1L);
+        Map<TopicPartition, Long> minPendingOffset = new HashMap<>();
 
         for (AppendRowsAttempt attempt : appendAttempts) {
-            boolean isDone = attempt.future.isDone();
-
-            // if is done, verify success before using
-            if (isDone) {
+            if (attempt.future.isDone()) {
+                // if completed, check if completed without errors
                 try {
                     attempt.future.get();
                 } catch (Exception ex) {
                     fatal.compareAndSet(null, ex);
                 }
                 maybeThrowFatal();
-            }
+            } else {
+                // if not completed
+                for (Map.Entry<TopicPartition, AppendRowsAttempt.OffsetRange> e : attempt.offsetRange.entrySet()) {
+                    TopicPartition topicPartition = e.getKey();
+                    AppendRowsAttempt.OffsetRange offsetRange = e.getValue();
 
-            boolean blocks = false;
-            for (Map.Entry<TopicPartition, Long> e : attempt.maxOffsetInThisAttempt.entrySet()) {
-                final TopicPartition tp = e.getKey();
-                final OffsetAndMetadata om = offsetsToCommit.get(tp);
-                if (om == null) continue; // Kafka is not trying to commit for this TP during current cycle
+                    OffsetAndMetadata offsetAndMetadataToCommit = offsetsToCommit.get(topicPartition);
+                    if (offsetAndMetadataToCommit == null) continue; // not committing this TP now
 
-                final long boundary = om.offset() - 1L;
-                final long maxInAttempt = e.getValue();
-                if (maxInAttempt > boundary) continue;  // irrelevant for this round
+                    long offsetToCommit = offsetAndMetadataToCommit.offset() - 1L;
 
-                if (isDone) {
-                    safeMaxOffsetPerTp.merge(tp, maxInAttempt, Math::max);
-                } else {
-                    blocks = true;
-                    break;
-                }
-
-            }
-            if (blocks) break;
-        }
-
-        final Map<TopicPartition, OffsetAndMetadata> result = new HashMap<>();
-        for (Map.Entry<TopicPartition, Long> e : safeMaxOffsetPerTp.entrySet()) {
-            long last = e.getValue();
-            if (last >= 0) result.put(e.getKey(), new OffsetAndMetadata(last + 1L));
-        }
-
-        gcAttempts(result);
-        return result;
-        }
-
-        private void gcAttempts(Map<TopicPartition, OffsetAndMetadata> committedThisRound) {
-            synchronized (appendAttempts) {
-                while (!appendAttempts.isEmpty()) {
-                    AppendRowsAttempt head = appendAttempts.peek();
-
-                    // Keep pending head; we still need it to compute contiguity next round
-                    if (!head.future.isDone()) break;
-
-                    boolean fullyBehind = true;
-                    for (Map.Entry<TopicPartition, Long> e : head.maxOffsetInThisAttempt.entrySet()) {
-                        TopicPartition tp = e.getKey();
-                        OffsetAndMetadata om = committedThisRound.get(tp);
-                        if (om == null) {                 // we didn't advance this TP this round → keep it
-                            fullyBehind = false;
-                            break;
-                        }
-                        long committedUpTo = om.offset() - 1L;
-                        if (e.getValue() > committedUpTo) {
-                            fullyBehind = false;            // head still straddles beyond what we just committed
-                            break;
-                        }
-                    }
-
-                    if (fullyBehind) {
-                        appendAttempts.poll();
-                    } else {
-                        break;
+                    if (offsetToCommit >= offsetRange.min) { // attempt's offsets overlap with what kafka is trying to commit
+                        minPendingOffset.merge(topicPartition, offsetRange.min, Math::min);
                     }
                 }
             }
         }
 
-//        private void gcAttempts (Map < TopicPartition, OffsetAndMetadata > committed){
-//            while (!appendAttempts.isEmpty()) {
-//                AppendRowsAttempt head = appendAttempts.peekFirst();
-//                boolean fullyBehind = true;
-//                for (Map.Entry<TopicPartition, Long> e : head.maxOffsetInThisAttempt.entrySet()) {
-//                    OffsetAndMetadata om = committed.get(e.getKey());
-//                    if (om == null) continue; // not committing this TP now; keep it
-//                    long committedUpTo = om.offset() - 1;
-//                    if (e.getValue() > committedUpTo) {
-//                        fullyBehind = false;
-//                        break;
-//                    }
-//                }
-//                if (fullyBehind) appendAttempts.removeFirst();
-//                else break;
-//            }
-//        }
+        // Build the result: if TP has a pending overlap, commit just before it (i.e., commit value = min);
+        // otherwise, commit exactly what Kafka asked for.
+        Map<TopicPartition, OffsetAndMetadata> safeToCommit = new HashMap<>();
+
+        for (Map.Entry<TopicPartition, OffsetAndMetadata> e : offsetsToCommit.entrySet()) {
+            TopicPartition requestedTopicPartition = e.getKey();
+            final OffsetAndMetadata requestedOffset = e.getValue();
+
+            final Long pendingMin = minPendingOffset.get(requestedTopicPartition);
+            if (pendingMin != null) {
+                // Safe last-written is pendingMin - 1, so commit value (next offset) is pendingMin
+                safeToCommit.put(requestedTopicPartition, new OffsetAndMetadata(pendingMin));
+            } else {
+                // No pending overlap at/below boundary so we can grant Kafka’s requested commit
+                safeToCommit.put(requestedTopicPartition, requestedOffset);
+            }
+        }
+
+        return safeToCommit;
+    }
 
         public static class Builder implements TableWriterBuilder {
             private final List<ConvertedRecord> records = new ArrayList<>();
@@ -291,11 +242,17 @@ public class AsyncStorageWriteApiWriter {
 
     private static class AppendRowsAttempt {
         final ApiFuture<AppendRowsResponse> future;
-        final Map<TopicPartition, Long> maxOffsetInThisAttempt;
+        final Map<TopicPartition, OffsetRange> offsetRange;
 
-        AppendRowsAttempt(ApiFuture<AppendRowsResponse> future, Map<TopicPartition, Long> maxOffsetInThisAttempt) {
+        AppendRowsAttempt(ApiFuture<AppendRowsResponse> future, Map<TopicPartition, OffsetRange> offsetRange) {
             this.future = future;
-            this.maxOffsetInThisAttempt = maxOffsetInThisAttempt;
+            this.offsetRange = offsetRange;
+        }
+
+        public static final class OffsetRange {
+            final long min;
+            final long max;
+            OffsetRange(long min, long max) { this.min = min; this.max = max; }
         }
     }
 }

@@ -222,7 +222,7 @@ public class BigQuerySinkTask extends SinkTask {
     }
 
     if (useStorageApi) {
-      return asyncDefaultWriter.computeSafeCommits(offsets);
+      return asyncDefaultWriter.getSafeToCommitOffsets(offsets);
     }
 
     flush(offsets);
