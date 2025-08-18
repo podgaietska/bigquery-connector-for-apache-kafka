@@ -43,9 +43,7 @@ import org.slf4j.LoggerFactory;
  * Keeps track of the number of failed threads in each batch of requests.
  */
 public class KcbqThreadPoolExecutor extends ThreadPoolExecutor {
-
   private static final Logger logger = LoggerFactory.getLogger(KcbqThreadPoolExecutor.class);
-
   private final AtomicReference<Throwable> encounteredError = new AtomicReference<>();
 
   /**
@@ -58,8 +56,8 @@ public class KcbqThreadPoolExecutor extends ThreadPoolExecutor {
       ThreadFactory threadFactory
   ) {
     super(
-        config.getInt(BigQuerySinkTaskConfig.THREAD_POOL_SIZE_CONFIG),
-        config.getInt(BigQuerySinkTaskConfig.THREAD_POOL_SIZE_CONFIG),
+        /* corePoolSize */ getPoolSize(config),
+        /* maximumPoolSize */ getPoolSize(config),
         // the following line is irrelevant because the core and max thread counts are the same.
         1, TimeUnit.SECONDS,
         workQueue,
@@ -119,5 +117,14 @@ public class KcbqThreadPoolExecutor extends ThreadPoolExecutor {
     Optional.ofNullable(encounteredError.get()).ifPresent(t -> {
       throw new BigQueryConnectException("A write thread has failed with an unrecoverable error", t);
     });
+  }
+
+  private static int getPoolSize(BigQuerySinkTaskConfig config) {
+    boolean useStorageWriteApi = config.getBoolean(BigQuerySinkTaskConfig.USE_STORAGE_WRITE_API_CONFIG);
+    if (useStorageWriteApi) {
+      logger.info("Attempting to use StorageWriteApi with single thread.");
+      return 1;
+    }
+    return config.getInt(BigQuerySinkTaskConfig.THREAD_POOL_SIZE_CONFIG);
   }
 }

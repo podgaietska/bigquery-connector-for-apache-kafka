@@ -185,7 +185,7 @@ public class BigQuerySinkTask extends SinkTask {
 
     // Return immediately here since the executor will already be shutdown
     if (stopped) {
-      if (useStorageApi && !useStorageApiBatchMode) {
+      if (useStorageApi) {
         asyncDefaultWriter.maybeThrowFatal();   // surface background failure
       }
       // Still have to check for errors in order to prevent offsets being committed for records that
@@ -195,7 +195,7 @@ public class BigQuerySinkTask extends SinkTask {
     }
 
     try {
-      if (useStorageApi && !useStorageApiBatchMode) {
+      if (useStorageApi) {
         // Wait until every previously submitted async write is completed
         asyncDefaultWriter.fenceAndDrain();
         // If anything failed, throw now to prevent committing offsets
@@ -354,7 +354,11 @@ public class BigQuerySinkTask extends SinkTask {
 
     // add tableWriters to the executor work queue
     for (TableWriterBuilder builder : tableWriterBuilders.values()) {
-      executor.execute(builder.build());
+      if (useStorageApi) {
+        builder.build().run();
+      } else {
+        executor.execute(builder.build());
+      }
     }
 
     // check if we should pause topics
@@ -665,7 +669,7 @@ public class BigQuerySinkTask extends SinkTask {
             attemptSchemaUpdate
         );
 
-        this.asyncDefaultWriter = new AsyncStorageWriteApiWriter(storageApiWriter, callbackExec);
+        this.asyncDefaultWriter = new AsyncStorageWriteApiWriter(storageApiWriter, executor, callbackExec);
       }
     }
   }

@@ -15,25 +15,25 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class AsyncStorageWriteApiWriter {
-    private final ExecutorService appendRowsExecutor = Executors.newSingleThreadExecutor();
+    private final Executor executor;
     private final Executor callbackExec;
     private final ArrayDeque<ApiFuture<Void>> futuresQueue = new ArrayDeque<>();
     private final AtomicReference<Throwable> fatal = new AtomicReference<>();
     private final StorageWriteApiBase streamWriter;
 
     public AsyncStorageWriteApiWriter(StorageWriteApiBase streamWriter,
+                            Executor appendRowsExecutor,
                             Executor callbackExec) {
+        this.executor = appendRowsExecutor;
         this.streamWriter = streamWriter;
         this.callbackExec = callbackExec;
     }
 
-    void submit(List<ConvertedRecord> batch, TableName tableName) {
-        appendRowsExecutor.execute(() -> {
+    void sendAppendRowsRequest(List<ConvertedRecord> batch, TableName tableName) {
+        executor.execute(() -> {
             checkForFailedResponses(false);
             try {
                 ApiFuture<Void> appendRowsResponseApiFuture =
@@ -55,7 +55,7 @@ public class AsyncStorageWriteApiWriter {
 
     public void fenceAndDrain() throws InterruptedException {
         CountDownLatch done = new CountDownLatch(1);
-        appendRowsExecutor.execute(() -> {
+        executor.execute(() -> {
             try {
                 checkForFailedResponses(true);
             } finally {
@@ -120,9 +120,8 @@ public class AsyncStorageWriteApiWriter {
          */
         @Override
         public Runnable build() {
-            // snapshot the list so the builder can be reused next poll if desired
             final List<ConvertedRecord> batch = new ArrayList<>(records);
-            return () -> asyncWriter.submit(batch, tableName);
+            return () -> asyncWriter.sendAppendRowsRequest(batch, tableName);
         }
 
         private JSONObject getJsonFromMap(Map<String, Object> map) {
