@@ -256,7 +256,7 @@ public abstract class StorageWriteApiBase {
     return f;
   }
 
-  protected ApiFuture<Void> asyncInitializeAndWriteRecords(
+  protected ApiFuture<AppendRowsResponse> asyncInitializeAndWriteRecords(
           TableName tableName,
           List<ConvertedRecord> rows,
           String streamName,
@@ -276,18 +276,7 @@ public abstract class StorageWriteApiBase {
       throw new RuntimeException(e);
     }
 
-    return ApiFutures.transform(
-            appendRowsResponseApiFuture,
-            ignored -> {
-              try {
-                writer.onSuccess();
-              } catch (RuntimeException rte) {
-                throw rte;
-              }
-              return null;
-            },
-            callbackExec
-    );
+    return appendRowsResponseApiFuture;
   }
 
   protected ApiFuture<AppendRowsResponse> writeBatchAsync(

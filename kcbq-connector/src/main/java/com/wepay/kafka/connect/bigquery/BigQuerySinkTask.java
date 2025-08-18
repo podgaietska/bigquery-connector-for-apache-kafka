@@ -185,9 +185,9 @@ public class BigQuerySinkTask extends SinkTask {
 
     // Return immediately here since the executor will already be shutdown
     if (stopped) {
-      if (useStorageApi) {
-        asyncDefaultWriter.maybeThrowFatal();   // surface background failure
-      }
+//      if (useStorageApi) {
+//        asyncDefaultWriter.maybeThrowFatal();   // surface background failure
+//      }
       // Still have to check for errors in order to prevent offsets being committed for records that
       // we've failed to write
       executor.maybeThrowEncounteredError();
@@ -195,13 +195,13 @@ public class BigQuerySinkTask extends SinkTask {
     }
 
     try {
-      if (useStorageApi) {
-        asyncDefaultWriter.awaitCurrentAppends();
-        asyncDefaultWriter.maybeThrowFatal();
-      } else {
+//      if (useStorageApi) {
+//        asyncDefaultWriter.awaitCurrentAppends();
+//        asyncDefaultWriter.maybeThrowFatal();
+//      } else {
         executor.awaitCurrentTasks();
         executor.maybeThrowEncounteredError();
-      }
+//      }
     } catch (InterruptedException err) {
       throw new ConnectException("Interrupted while waiting for write tasks to complete.", err);
     }
@@ -219,6 +219,10 @@ public class BigQuerySinkTask extends SinkTask {
       Map<TopicPartition, OffsetAndMetadata> result = batchHandler.getCommitableOffsets();
       logger.debug("Commitable Offsets for storage api batch mode : " + result.toString());
       return result;
+    }
+
+    if (useStorageApi) {
+      return asyncDefaultWriter.computeSafeCommits(offsets);
     }
 
     flush(offsets);
