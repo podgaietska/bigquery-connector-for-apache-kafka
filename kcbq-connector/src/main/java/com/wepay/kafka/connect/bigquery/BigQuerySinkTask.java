@@ -574,7 +574,7 @@ public class BigQuerySinkTask extends SinkTask {
     topicToPartitionTableId = new HashMap<>();
     bigQuery = new AtomicReference<>();
     schemaManager = new AtomicReference<>();
-    this.callbackExec = Executors.newFixedThreadPool(2);
+    this.callbackExec = Executors.newFixedThreadPool(config.getInt(BigQuerySinkTaskConfig.THREAD_POOL_SIZE_CONFIG));
 
     // Initialise errantRecordReporter
     ErrantRecordReporter errantRecordReporter = null;
