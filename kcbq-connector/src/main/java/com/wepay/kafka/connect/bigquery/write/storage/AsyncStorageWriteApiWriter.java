@@ -21,7 +21,6 @@ public class AsyncStorageWriteApiWriter {
     private final Executor executor;
     private final Executor callbackExec;
     private final ConcurrentLinkedQueue<AppendRowsAttempt> appendAttempts = new ConcurrentLinkedQueue<>();
-//    private final ArrayDeque<ApiFuture<Void>> futuresQueue = new ArrayDeque<>();
     private final AtomicReference<Throwable> fatal = new AtomicReference<>();
     private final StorageWriteApiBase streamWriter;
 
@@ -35,13 +34,11 @@ public class AsyncStorageWriteApiWriter {
 
     void sendAppendRowsRequest(List<ConvertedRecord> batch, TableName tableName) {
         executor.execute(() -> {
-            checkForFailedResponses();
-
             try {
                 ApiFuture<AppendRowsResponse> appendRowsResponseApiFuture =
                         streamWriter.asyncInitializeAndWriteRecords(tableName, batch, "default", callbackExec);
-                Map<TopicPartition, AppendRowsAttempt.OffsetRange> maxOffsets = computeOffsetRange(batch);
-                appendAttempts.add(new AppendRowsAttempt(appendRowsResponseApiFuture, maxOffsets));
+                Map<TopicPartition, Long> minOffsetsByTp = computeMinOffsetsPerTp(batch);
+                appendAttempts.add(new AppendRowsAttempt(appendRowsResponseApiFuture, minOffsetsByTp));
 
 //                f.addListener(() -> {
 //                    try {
@@ -84,10 +81,10 @@ public class AsyncStorageWriteApiWriter {
 //        maybeThrowFatal();
 //    }
 
-    private void checkForFailedResponses() {
+    private void drainCompletedAppends(boolean wait) {
         while (!appendAttempts.isEmpty()) {
             AppendRowsAttempt head = appendAttempts.peek();
-            if (!head.future.isDone()) break;
+            if (!wait && !head.future.isDone()) break;
             try {
                 head.future.get();
             } catch (Exception e) {
@@ -98,80 +95,199 @@ public class AsyncStorageWriteApiWriter {
         }
     }
 
-    private Map<TopicPartition,  AppendRowsAttempt.OffsetRange> computeOffsetRange(List<ConvertedRecord> batch) {
-        Map<TopicPartition,  AppendRowsAttempt.OffsetRange> result = new HashMap<>();
+    private Map<TopicPartition, Long> computeMinOffsetsPerTp(List<ConvertedRecord> batch) {
+        Map<TopicPartition, Long> minOffsetForTp = new HashMap<>();
         for (ConvertedRecord record : batch) {
             SinkRecord originalRecord = record.original();
-            TopicPartition topicPartition = new TopicPartition(originalRecord.topic(), originalRecord.kafkaPartition());
-            long currentOffset = originalRecord.kafkaOffset();
-            AppendRowsAttempt.OffsetRange currentOffsetRange = result.get(topicPartition);
-
-            if (currentOffsetRange == null) {
-                result.put(topicPartition, new  AppendRowsAttempt.OffsetRange(currentOffset, currentOffset));
-            } else {
-                result.put(topicPartition, new  AppendRowsAttempt.OffsetRange(
-                        Math.min(currentOffsetRange.min, currentOffset), Math.max(currentOffsetRange.max, currentOffset))
-                );
-            }
+            TopicPartition tp = new TopicPartition(originalRecord.topic(), originalRecord.kafkaPartition());
+            long offset = originalRecord.kafkaOffset();
+            minOffsetForTp.merge(tp, offset, Math::min);
         }
-        return result;
+        return minOffsetForTp;
     }
 
+    // VERSION 2
     public Map<TopicPartition, OffsetAndMetadata> getSafeToCommitOffsets(
             Map<TopicPartition, OffsetAndMetadata> offsetsToCommit) {
-        // check all done responses and surface any failures before proceeding with committing.
-        checkForFailedResponses();
+        // trim completed responses from head and surface any failures
+        drainCompletedAppends(/* wait */ false);
         maybeThrowFatal();
 
-        Map<TopicPartition, Long> minPendingOffset = new HashMap<>();
+        final Map<TopicPartition, Long> minPendingOffset = new HashMap<>(offsetsToCommit.size());
+        final Set<TopicPartition> unresolved = new HashSet<>(offsetsToCommit.keySet());
+        final Map<TopicPartition, Long> tpBoundary = new HashMap<>(offsetsToCommit.size());
+        offsetsToCommit.forEach((tp, om) -> tpBoundary.put(tp, om.offset() - 1L));
 
-        for (AppendRowsAttempt attempt : appendAttempts) {
-            if (attempt.future.isDone()) {
-                // if completed, check if completed without errors
+        for (AppendRowsAttempt attempt: appendAttempts) {
+            final boolean done = attempt.future.isDone();
+            if (done) {
                 try {
                     attempt.future.get();
                 } catch (Exception ex) {
                     fatal.compareAndSet(null, ex);
                 }
                 maybeThrowFatal();
-            } else {
-                // if not completed
-                for (Map.Entry<TopicPartition, AppendRowsAttempt.OffsetRange> e : attempt.offsetRange.entrySet()) {
-                    TopicPartition topicPartition = e.getKey();
-                    AppendRowsAttempt.OffsetRange offsetRange = e.getValue();
-
-                    OffsetAndMetadata offsetAndMetadataToCommit = offsetsToCommit.get(topicPartition);
-                    if (offsetAndMetadataToCommit == null) continue; // not committing this TP now
-
-                    long offsetToCommit = offsetAndMetadataToCommit.offset() - 1L;
-
-                    if (offsetToCommit >= offsetRange.min) { // attempt's offsets overlap with what kafka is trying to commit
-                        minPendingOffset.merge(topicPartition, offsetRange.min, Math::min);
-                    }
-                }
             }
+
+            for (Map.Entry<TopicPartition, Long> e : attempt.minOffsetByTp.entrySet()) {
+                final TopicPartition tp = e.getKey();
+                if (!unresolved.contains(tp)) continue;
+
+                final Long minOffsetInAttempt = e.getValue();
+                final long boundary = tpBoundary.get(tp);
+
+                if (minOffsetInAttempt > boundary) {
+                    // first attempt we see for this TP starts beyond boundary so (regardless of done/pending)
+                    unresolved.remove(tp);
+                } else if (!done) {
+                    // pending overlap: block this TP, commit value will be minInAttempt
+                    minPendingOffset.put(tp, minOffsetInAttempt);
+                    unresolved.remove(tp);
+                }
+                // else if done & min ≤ b: already written; keep TP unresolved and keep scanning
+            }
+
+            if (unresolved.isEmpty()) break; // early exit cuz all commitable offsets for TPs have been decided
         }
 
-        // Build the result: if TP has a pending overlap, commit just before it (i.e., commit value = min);
+        // Build the result: if TP has a pending overlap, commit just before it (commit value = min);
         // otherwise, commit exactly what Kafka asked for.
-        Map<TopicPartition, OffsetAndMetadata> safeToCommit = new HashMap<>();
+        Map<TopicPartition, OffsetAndMetadata> safeToCommit = new HashMap<>(offsetsToCommit.size());
 
-        for (Map.Entry<TopicPartition, OffsetAndMetadata> e : offsetsToCommit.entrySet()) {
-            TopicPartition requestedTopicPartition = e.getKey();
-            final OffsetAndMetadata requestedOffset = e.getValue();
+        for (Map.Entry<TopicPartition, OffsetAndMetadata> requested : offsetsToCommit.entrySet()) {
+            TopicPartition tp = requested.getKey();
+            final Long pendingMin = minPendingOffset.get(tp);
 
-            final Long pendingMin = minPendingOffset.get(requestedTopicPartition);
             if (pendingMin != null) {
                 // Safe last-written is pendingMin - 1, so commit value (next offset) is pendingMin
-                safeToCommit.put(requestedTopicPartition, new OffsetAndMetadata(pendingMin));
+                safeToCommit.put(tp, new OffsetAndMetadata(pendingMin));
             } else {
                 // No pending overlap at/below boundary so we can grant Kafka’s requested commit
-                safeToCommit.put(requestedTopicPartition, requestedOffset);
+                safeToCommit.put(tp, requested.getValue());
             }
         }
 
         return safeToCommit;
     }
+
+    // VERSION 1
+//    public Map<TopicPartition, OffsetAndMetadata> getSafeToCommitOffsets(
+//            Map<TopicPartition, OffsetAndMetadata> offsetsToCommit) {
+//        // trim completed responses from head and surface any failures
+//        drainCompletedAppends(/* wait */ false);
+//        maybeThrowFatal();
+//
+//        final Map<TopicPartition, Long> minPendingOffset = new HashMap<>(offsetsToCommit.size());
+//        final Set<TopicPartition> unresolved = new HashSet<>(offsetsToCommit.keySet());
+//        final Map<TopicPartition, Long> tpBoundary = new HashMap<>(offsetsToCommit.size());
+//        offsetsToCommit.forEach((tp, om) -> tpBoundary.put(tp, om.offset() - 1L));
+//
+//        for (AppendRowsAttempt attempt: appendAttempts) {
+//            if (attempt.future.isDone()) {
+//                try {
+//                    attempt.future.get();
+//                } catch (Exception ex) {
+//                    fatal.compareAndSet(null, ex);
+//                }
+//                maybeThrowFatal();
+//                continue;
+//            }
+//
+//            for (Map.Entry<TopicPartition, Long> e : attempt.minOffsetByTp.entrySet()) {
+//                final TopicPartition tp = e.getKey();
+//                if (!unresolved.contains(tp)) continue;
+//
+//                final Long minOffsetInAttempt = e.getValue();
+//                final long boundary = tpBoundary.get(tp);
+//
+//                if (minOffsetInAttempt > boundary) {
+//                    // First time we've seen this TP and min offset in this attempt is greater than one kafka
+//                    // wants to commit. Means kafka is safe to commit offset it wants
+//                    unresolved.remove(tp);
+//                } else {
+//                    minPendingOffset.put(tp, minOffsetInAttempt);
+//                    unresolved.remove(tp);
+//                }
+//            }
+//
+//            if (unresolved.isEmpty()) break; // early exit: all TPs decided
+//        }
+//
+//        // Build the result: if TP has a pending overlap, commit just before it (i.e., commit value = min);
+//        // otherwise, commit exactly what Kafka asked for.
+//        Map<TopicPartition, OffsetAndMetadata> safeToCommit = new HashMap<>(offsetsToCommit.size());
+//
+//        for (Map.Entry<TopicPartition, OffsetAndMetadata> requested : offsetsToCommit.entrySet()) {
+//            TopicPartition tp = requested.getKey();
+//            final Long pendingMin = minPendingOffset.get(tp);
+//
+//            if (pendingMin != null) {
+//                // Safe last-written is pendingMin - 1, so commit value (next offset) is pendingMin
+//                safeToCommit.put(tp, new OffsetAndMetadata(pendingMin));
+//            } else {
+//                // No pending overlap at/below boundary so we can grant Kafka’s requested commit
+//                safeToCommit.put(tp, requested.getValue());
+//            }
+//        }
+//
+//        return safeToCommit;
+//    }
+
+//    public Map<TopicPartition, OffsetAndMetadata> getSafeToCommitOffsets(
+//            Map<TopicPartition, OffsetAndMetadata> offsetsToCommit) {
+//        // trim completed responses from head and surface any failures
+//        checkForFailedResponses();
+//        maybeThrowFatal();
+//
+//        Map<TopicPartition, Long> minPendingOffset = new HashMap<>();
+//
+//        for (AppendRowsAttempt attempt : appendAttempts) {
+//            if (attempt.future.isDone()) {
+//                // if completed, check if completed without errors
+//                try {
+//                    attempt.future.get();
+//                } catch (Exception ex) {
+//                    fatal.compareAndSet(null, ex);
+//                }
+//                maybeThrowFatal();
+//            } else {
+//                // if not completed
+//                for (Map.Entry<TopicPartition, AppendRowsAttempt.OffsetRange> e : attempt.offsetRange.entrySet()) {
+//                    TopicPartition topicPartition = e.getKey();
+//                    AppendRowsAttempt.OffsetRange offsetRange = e.getValue();
+//
+//                    OffsetAndMetadata offsetAndMetadataToCommit = offsetsToCommit.get(topicPartition);
+//                    if (offsetAndMetadataToCommit == null) continue; // not committing this TP now
+//
+//                    long offsetToCommit = offsetAndMetadataToCommit.offset() - 1L;
+//
+//                    if (offsetToCommit >= offsetRange.min) { // attempt's offsets overlap with what kafka is trying to commit
+//                        minPendingOffset.merge(topicPartition, offsetRange.min, Math::min);
+//                    }
+//                }
+//            }
+//        }
+//
+//        // Build the result: if TP has a pending overlap, commit just before it (i.e., commit value = min);
+//        // otherwise, commit exactly what Kafka asked for.
+//        Map<TopicPartition, OffsetAndMetadata> safeToCommit = new HashMap<>();
+//
+//        for (Map.Entry<TopicPartition, OffsetAndMetadata> e : offsetsToCommit.entrySet()) {
+//            TopicPartition requestedTopicPartition = e.getKey();
+//            final OffsetAndMetadata requestedOffset = e.getValue();
+//
+//            final Long pendingMin = minPendingOffset.get(requestedTopicPartition);
+//            if (pendingMin != null) {
+//                // Safe last-written is pendingMin - 1, so commit value (next offset) is pendingMin
+//                safeToCommit.put(requestedTopicPartition, new OffsetAndMetadata(pendingMin));
+//            } else {
+//                // No pending overlap at/below boundary so we can grant Kafka’s requested commit
+//                safeToCommit.put(requestedTopicPartition, requestedOffset);
+//            }
+//        }
+//
+//        return safeToCommit;
+//    }
 
         public static class Builder implements TableWriterBuilder {
             private final List<ConvertedRecord> records = new ArrayList<>();
@@ -242,17 +358,11 @@ public class AsyncStorageWriteApiWriter {
 
     private static class AppendRowsAttempt {
         final ApiFuture<AppendRowsResponse> future;
-        final Map<TopicPartition, OffsetRange> offsetRange;
+        final Map<TopicPartition, Long> minOffsetByTp;
 
-        AppendRowsAttempt(ApiFuture<AppendRowsResponse> future, Map<TopicPartition, OffsetRange> offsetRange) {
+        AppendRowsAttempt(ApiFuture<AppendRowsResponse> future, Map<TopicPartition, Long> minOffsetByTp) {
             this.future = future;
-            this.offsetRange = offsetRange;
-        }
-
-        public static final class OffsetRange {
-            final long min;
-            final long max;
-            OffsetRange(long min, long max) { this.min = min; this.max = max; }
+            this.minOffsetByTp = minOffsetByTp;
         }
     }
 }
