@@ -167,6 +167,7 @@ public class AsyncStorageWriteApiWriter {
             }
         }
 
+        drainCompletedAppends(false);
         return safeToCommit;
     }
 
