@@ -166,7 +166,7 @@ public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
 
     @Override
     public String streamName() {
-      return StorageWriteApiWriter.DEFAULT;
+      return "default";
     }
   }
 
