@@ -26,10 +26,12 @@ package com.wepay.kafka.connect.bigquery.write.storage;
 import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutures;
 import com.google.api.core.SettableApiFuture;
+import com.google.api.gax.retrying.RetrySettings;
 import com.google.cloud.bigquery.storage.v1.AppendRowsResponse;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteClient;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteSettings;
 import com.google.cloud.bigquery.storage.v1.Exceptions;
+import com.google.cloud.bigquery.storage.v1.JsonStreamWriter;
 import com.google.cloud.bigquery.storage.v1.RowError;
 import com.google.cloud.bigquery.storage.v1.TableName;
 import com.google.common.annotations.VisibleForTesting;
@@ -52,6 +54,7 @@ import org.apache.kafka.connect.sink.SinkRecord;
 import org.json.JSONArray;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.threeten.bp.Duration;
 
 /**
  * Base class which handles data ingestion to bigquery tables using different kind of streams
@@ -59,6 +62,9 @@ import org.slf4j.LoggerFactory;
 public abstract class StorageWriteApiBase {
 
   private static final Logger logger = LoggerFactory.getLogger(StorageWriteApiBase.class);
+  private static final double RETRY_DELAY_MULTIPLIER = 1.1;
+  private static final int MAX_RETRY_DELAY_MINUTES = 1;
+  protected final JsonStreamWriterFactory jsonWriterFactory;
   protected final int retry;
   protected final long retryWait;
   private final boolean autoCreateTables;
@@ -97,6 +103,7 @@ public abstract class StorageWriteApiBase {
       logger.error("Failed to create Big Query Storage Write API write client due to {}", e.getMessage());
       throw new BigQueryStorageWriteApiConnectException("Failed to create Big Query Storage Write API write client", e);
     }
+    this.jsonWriterFactory = getJsonWriterFactory();
     this.time = Time.SYSTEM;
   }
 
@@ -325,6 +332,23 @@ public abstract class StorageWriteApiBase {
       this.writeClient = BigQueryWriteClient.create(writeSettings);
     }
     return this.writeClient;
+  }
+
+  /**
+   * Returns a {@link JsonStreamWriterFactory} for creating configured {@link JsonStreamWriter} instances
+   *
+   * @return a {@link JsonStreamWriterFactory}
+   */
+  protected JsonStreamWriterFactory getJsonWriterFactory() {
+    RetrySettings retrySettings = RetrySettings.newBuilder()
+            .setMaxAttempts(retry)
+            .setInitialRetryDelay(Duration.ofMillis(retryWait))
+            .setRetryDelayMultiplier(RETRY_DELAY_MULTIPLIER)
+            .setMaxRetryDelay(Duration.ofMinutes(MAX_RETRY_DELAY_MINUTES))
+            .build();
+    return streamOrTableName -> JsonStreamWriter.newBuilder(streamOrTableName, writeClient)
+            .setRetrySettings(retrySettings)
+            .build();
   }
 
   /**

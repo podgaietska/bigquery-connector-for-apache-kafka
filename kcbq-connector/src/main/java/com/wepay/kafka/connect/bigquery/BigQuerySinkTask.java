@@ -548,6 +548,11 @@ public class BigQuerySinkTask extends SinkTask {
     return cache;
   }
 
+  // visible for testing
+  boolean isRunning() {
+    return !stopped;
+  }
+
   @Override
   public void start(Map<String, String> properties) {
     logger.trace("task.start()");
