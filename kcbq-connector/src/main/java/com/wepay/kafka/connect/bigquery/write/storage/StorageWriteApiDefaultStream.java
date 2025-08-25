@@ -37,6 +37,8 @@ import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+
+import com.wepay.kafka.connect.bigquery.write.batch.KcbqThreadPoolExecutor;
 import org.json.JSONArray;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,7 +56,8 @@ public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
                                       boolean autoCreateTables,
                                       ErrantRecordHandler errantRecordHandler,
                                       SchemaManager schemaManager,
-                                      boolean attemptSchemaUpdate) {
+                                      boolean attemptSchemaUpdate,
+                                      KcbqThreadPoolExecutor executor) {
     super(
         retry,
         retryWait,
@@ -62,7 +65,8 @@ public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
         autoCreateTables,
         errantRecordHandler,
         schemaManager,
-        attemptSchemaUpdate
+        attemptSchemaUpdate,
+        executor
     );
   }
 

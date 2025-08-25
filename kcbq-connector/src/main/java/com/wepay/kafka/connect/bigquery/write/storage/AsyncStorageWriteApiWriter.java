@@ -2,9 +2,9 @@ package com.wepay.kafka.connect.bigquery.write.storage;
 
 import com.google.api.core.ApiFuture;
 import com.google.cloud.bigquery.TableId;
-import com.google.cloud.bigquery.storage.v1.AppendRowsResponse;
 import com.google.cloud.bigquery.storage.v1.TableName;
 import com.wepay.kafka.connect.bigquery.utils.SinkRecordConverter;
+import com.wepay.kafka.connect.bigquery.write.batch.KcbqThreadPoolExecutor;
 import com.wepay.kafka.connect.bigquery.write.batch.TableWriterBuilder;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
@@ -15,56 +15,32 @@ import org.json.JSONObject;
 import javax.annotation.Nullable;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 public class AsyncStorageWriteApiWriter {
-    private final Executor callbackExec;
+    private final KcbqThreadPoolExecutor executor;
     private final Thread drainer = new Thread(this::drainHeadLoop);
     private volatile boolean running = true;
     private final ConcurrentLinkedQueue<AppendRowsAttempt> appendAttempts = new ConcurrentLinkedQueue<>();
-    private final AtomicReference<Throwable> fatal = new AtomicReference<>();
     private final StorageWriteApiBase streamWriter;
 
     public AsyncStorageWriteApiWriter(StorageWriteApiBase streamWriter,
-                                      Executor callbackExec) {
+                                      KcbqThreadPoolExecutor executor) {
         this.streamWriter = streamWriter;
-        this.callbackExec = callbackExec;
+        this.executor = executor;
         startDrainer();
     }
 
     void sendAppendRowsRequest(List<ConvertedRecord> batch, TableName tableName, String streamName) {
         try {
-            ApiFuture<AppendRowsResponse> appendRowsResponseApiFuture =
-                    streamWriter.initializeAndWriteRecords(tableName, batch, streamName, callbackExec);
+            ApiFuture<Void> appendRowsResponseApiFuture =
+                    streamWriter.initializeAndWriteRecords(tableName, batch, streamName);
             Map<TopicPartition, Long> minOffsetsByTp = computeMinOffsetsPerTp(batch);
             appendAttempts.add(new AppendRowsAttempt(appendRowsResponseApiFuture, minOffsetsByTp));
         } catch (Throwable t) {
-            fatal.compareAndSet(null, t);
+            reportTerminal(t);
         }
     }
-
-    public void maybeThrowFatal() {
-        Throwable t = fatal.get();
-        if (t != null) {
-            if (t instanceof RuntimeException) throw (RuntimeException) t;
-            throw new org.apache.kafka.connect.errors.ConnectException(t);
-        }
-    }
-
-//    private void drainCompletedAppends(boolean wait) {
-//        while (!appendAttempts.isEmpty()) {
-//            AppendRowsAttempt head = appendAttempts.peek();
-//            if (!wait && !head.future.isDone()) break;
-//            try {
-//                head.future.get();
-//            } catch (Exception e) {
-//                fatal.compareAndSet(null, e);
-//            } finally {
-//                appendAttempts.poll();
-//            }
-//        }
-//    }
 
     private void drainHeadLoop() {
         final long SLEEP_NANOS = TimeUnit.MICROSECONDS.toNanos(200);
@@ -81,11 +57,15 @@ public class AsyncStorageWriteApiWriter {
                     continue;
                 }
                 // future completed: surface failure (non-blocking) and remove
-                try { head.future.get(); } catch (Exception e) { fatal.compareAndSet(null, e); }
+                try {
+                    head.future.get();
+                } catch (Exception e) {
+                    reportTerminal(e);
+                }
                 appendAttempts.poll(); // remove head
             }
         } catch (Throwable t) {
-            fatal.compareAndSet(null, t);
+            reportTerminal(t);
         }
     }
 
@@ -113,9 +93,6 @@ public class AsyncStorageWriteApiWriter {
     // VERSION 2
     public Map<TopicPartition, OffsetAndMetadata> getCommittableOffsets(
             Map<TopicPartition, OffsetAndMetadata> offsetsToCommit) {
-        // trim completed responses from head and surface any failures
-        maybeThrowFatal();
-
         final Map<TopicPartition, Long> minPendingOffset = new HashMap<>(offsetsToCommit.size());
         final Set<TopicPartition> unresolved = new HashSet<>(offsetsToCommit.keySet());
         final Map<TopicPartition, Long> tpBoundary = new HashMap<>(offsetsToCommit.size());
@@ -127,9 +104,9 @@ public class AsyncStorageWriteApiWriter {
                 try {
                     attempt.future.get();
                 } catch (Exception ex) {
-                    fatal.compareAndSet(null, ex);
+                    reportTerminal(ex);
                 }
-                maybeThrowFatal();
+                executor.maybeThrowEncounteredError();
             }
 
             for (Map.Entry<TopicPartition, Long> e : attempt.minOffsetByTp.entrySet()) {
@@ -173,7 +150,12 @@ public class AsyncStorageWriteApiWriter {
         return safeToCommit;
     }
 
-        public static class Builder implements TableWriterBuilder {
+    void reportTerminal(Throwable throwable) {
+        executor.reportError(throwable);
+    }
+
+
+    public static class Builder implements TableWriterBuilder {
             private final List<ConvertedRecord> records = new ArrayList<>();
             private final SinkRecordConverter recordConverter;
             private final TableName tableName;
@@ -245,10 +227,10 @@ public class AsyncStorageWriteApiWriter {
         }
 
     private static class AppendRowsAttempt {
-        final ApiFuture<AppendRowsResponse> future;
+        final ApiFuture<Void> future;
         final Map<TopicPartition, Long> minOffsetByTp;
 
-        AppendRowsAttempt(ApiFuture<AppendRowsResponse> future, Map<TopicPartition, Long> minOffsetByTp) {
+        AppendRowsAttempt(ApiFuture<Void> future, Map<TopicPartition, Long> minOffsetByTp) {
             this.future = future;
             this.minOffsetByTp = minOffsetByTp;
         }

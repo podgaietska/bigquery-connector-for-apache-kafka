@@ -64,7 +64,7 @@ public class StorageApiBatchModeHandler {
   public String updateOffsetsOnStream(
       String tableName,
       List<ConvertedRecord> rows) {
-    logger.trace("Updating offsets on current stream of table {}", tableName);
+    logger.info("Updating offsets on current stream of table {}", tableName);
     return this.streamApi.updateOffsetsOnStream(tableName, rows);
   }
 

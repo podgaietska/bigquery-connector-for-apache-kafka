@@ -23,6 +23,9 @@
 
 package com.wepay.kafka.connect.bigquery.write.storage;
 
+import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutures;
+import com.google.api.core.SettableApiFuture;
 import com.google.cloud.bigquery.BigQueryException;
 import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.storage.v1.TableName;
@@ -32,6 +35,10 @@ import com.wepay.kafka.connect.bigquery.utils.TableNameUtils;
 import com.wepay.kafka.connect.bigquery.utils.Time;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.slf4j.Logger;
@@ -119,6 +126,30 @@ public class StorageWriteApiRetryHandler {
     }
   }
 
+  public ApiFuture<Void> maybeRetryAsync(String operation, Executor exec) {
+    if (currentAttempt < (userConfiguredRetry + additionalRetries)) {
+      currentAttempt++;
+      long waitDuration = userConfiguredRetryWait + additionalWait + random.nextInt(1000);
+
+      SettableApiFuture<Void> delayFuture = SettableApiFuture.create();
+      CompletableFuture.runAsync(() -> {}, CompletableFuture.delayedExecutor(waitDuration, TimeUnit.MILLISECONDS, exec))
+              .whenComplete((v, t) ->
+              {
+                if (t != null) {
+                delayFuture.setException(t);
+                } else  {
+                  delayFuture.set(null);
+                }
+              });
+      return delayFuture;
+    } else {
+      throw new BigQueryStorageWriteApiConnectException(
+              String.format("Exceeded %s attempts to %s ", getAttempt(), operation),
+              getMostRecentException()
+      );
+    }
+  }
+
   /**
    * Attempts to create table
    *
@@ -140,5 +171,27 @@ public class StorageWriteApiRetryHandler {
           "Failed to create table " + tableId(), exception);
     }
   }
-
+  public ApiFuture<Void> attemptTableOperationAsync(BiConsumer<TableId, List<SinkRecord>> tableOperation,
+                                                    Executor exec) {
+    SettableApiFuture<Void> f = SettableApiFuture.create();
+    exec.execute(() -> {
+      try {
+        tableOperation.accept(tableId(), records);
+        setAdditionalRetriesAndWait();
+        f.set(null);
+      } catch (BigQueryException exception) {
+        if (BigQueryErrorResponses.isRateLimitExceededError(exception)) {
+          setAdditionalRetriesAndWait();
+          f.set(null);
+        } else {
+          f.setException(new BigQueryStorageWriteApiConnectException(
+                  "Failed to create table " + tableId(), exception));
+        }
+      } catch (Throwable t) {
+        f.setException(new BigQueryStorageWriteApiConnectException(
+                "Failed table operation on " + tableId(), t));
+      }
+    });
+    return f;
+  }
 }

@@ -131,7 +131,6 @@ public class BigQuerySinkTask extends SinkTask {
   private long retryWait;
   private Map<String, PartitionedTableId> topicToPartitionTableId;
   private AsyncStorageWriteApiWriter asyncDefaultWriter;
-  private Executor callbackExec;
   private boolean allowNewBigQueryFields;
   private boolean useCredentialsProjectId;
   private boolean allowRequiredFieldRelaxation;
@@ -233,7 +232,6 @@ public class BigQuerySinkTask extends SinkTask {
       }
       return new PartitionedTableId.Builder(baseTableId).build();
     });
-
   }
 
   private PartitionedTableId getRecordTable(SinkRecord record) {
@@ -348,11 +346,7 @@ public class BigQuerySinkTask extends SinkTask {
 
     // add tableWriters to the executor work queue
     for (TableWriterBuilder builder : tableWriterBuilders.values()) {
-      if (useStorageApi) {
-        builder.build().run();
-      } else {
-        executor.execute(builder.build());
-      }
+      executor.execute(builder.build());
     }
 
     // check if we should pause topics
@@ -573,7 +567,6 @@ public class BigQuerySinkTask extends SinkTask {
     topicToPartitionTableId = new HashMap<>();
     bigQuery = new AtomicReference<>();
     schemaManager = new AtomicReference<>();
-    this.callbackExec = Executors.newFixedThreadPool(config.getInt(BigQuerySinkTaskConfig.THREAD_POOL_SIZE_CONFIG));
 
     // Initialise errantRecordReporter
     ErrantRecordReporter errantRecordReporter = null;
@@ -645,7 +638,8 @@ public class BigQuerySinkTask extends SinkTask {
             autoCreateTables,
             errantRecordHandler,
             getSchemaManager(),
-            attemptSchemaUpdate
+            attemptSchemaUpdate,
+            executor
         );
         storageApiWriter = writer;
 
@@ -665,11 +659,11 @@ public class BigQuerySinkTask extends SinkTask {
             autoCreateTables,
             errantRecordHandler,
             getSchemaManager(),
-            attemptSchemaUpdate
+            attemptSchemaUpdate,
+            executor
         );
-
-        this.asyncDefaultWriter = new AsyncStorageWriteApiWriter(storageApiWriter, callbackExec);
       }
+      asyncDefaultWriter = new AsyncStorageWriteApiWriter(storageApiWriter, executor);
     }
   }
 
@@ -685,9 +679,6 @@ public class BigQuerySinkTask extends SinkTask {
 
   private void maybeThrowErrors() {
     executor.maybeThrowEncounteredError();
-    if (useStorageApi && !useStorageApiBatchMode) {
-      asyncDefaultWriter.maybeThrowFatal();
-    }
     if (useStorageApiBatchMode && loadExecutor.isTerminated()) {
       throw new BigQueryStorageWriteApiConnectException(
           "Batch load handler is terminated, failing task as no data would be written to bigquery tables!");

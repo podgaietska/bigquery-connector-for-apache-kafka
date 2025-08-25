@@ -43,6 +43,8 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
+
+import com.wepay.kafka.connect.bigquery.write.batch.KcbqThreadPoolExecutor;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.sink.SinkRecord;
@@ -80,13 +82,14 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
   protected ConcurrentMap<ApplicationStream, Object> streamLocks;
 
   public StorageWriteApiBatchApplicationStream(
-      int retry,
-      long retryWait,
-      BigQueryWriteSettings writeSettings,
-      boolean autoCreateTables,
-      ErrantRecordHandler errantRecordHandler,
-      SchemaManager schemaManager,
-      boolean attemptSchemaUpdate) {
+          int retry,
+          long retryWait,
+          BigQueryWriteSettings writeSettings,
+          boolean autoCreateTables,
+          ErrantRecordHandler errantRecordHandler,
+          SchemaManager schemaManager,
+          boolean attemptSchemaUpdate,
+          KcbqThreadPoolExecutor executor) {
     super(
         retry,
         retryWait,
@@ -94,7 +97,8 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
         autoCreateTables,
         errantRecordHandler,
         schemaManager,
-        attemptSchemaUpdate
+        attemptSchemaUpdate,
+        executor
     );
     streams = new ConcurrentHashMap<>();
     currentStreams = new ConcurrentHashMap<>();
@@ -144,13 +148,13 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
               ApplicationStream applicationStream = applicationStreamEntry.getValue();
               String streamName = applicationStreamEntry.getKey();
               if (applicationStream.isInactive()) {
-                logger.trace("Ignoring inactive stream {} at index {}", streamName, i);
+                logger.info("Ignoring inactive stream {} at index {}", streamName, i);
               } else if (applicationStream.isReadyForOffsetCommit()) {
-                logger.trace("Pulling offsets from committed stream {} at index {} ", streamName, i);
+                logger.info("Pulling offsets from committed stream {} at index {} ", streamName, i);
                 offsetsReadyForCommits.putAll(applicationStream.getOffsetInformation());
                 applicationStream.markInactive();
               } else {
-                logger.trace("Ignoring all streams as stream {} at index {} is not yet committed", streamName, i);
+                logger.info("Ignoring all streams as stream {} at index {} is not yet committed", streamName, i);
                 // We move sequentially for offset commit, until current offsets are ready, we cannot commit next.
                 break;
               }
@@ -224,6 +228,7 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
       streamName = this.getCurrentStreamForTable(tableName, rows);
       this.streams.get(tableName).get(streamName).updateOffsetInformation(offsetInfo, rows.size());
     }
+    logger.info("Assigned offsets {} to stream {} for {} rows", offsetInfo, streamName, rows.size());
     logger.trace("Assigned offsets {} to stream {} for {} rows", offsetInfo, streamName, rows.size());
     return streamName;
   }
@@ -333,27 +338,28 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
    */
   private void commitStreamIfEligible(String tableName, String streamName) {
     if (!Objects.equals(currentStreams.get(tableName), streamName)) {
-      logger.trace("Stream {} is not active, can be committed", streamName);
+      logger.info("Stream {} is not active, can be committed", streamName);
       ApplicationStream stream = this.streams.get(tableName).get(streamName);
       synchronized (lock(stream)) {
         if (stream != null && stream.areAllExpectedCallsCompleted()) {
           if (!stream.canBeCommitted()) {
-            logger.trace("Stream {} with state {} is not committable", streamName, stream.getCurrentState());
+            logger.info("Stream {} with state {} is not committable", streamName, stream.getCurrentState());
             return;
           }
           // We are done with all expected calls for non-active streams, lets finalise and commit the stream.
-          logger.trace("Stream {} has written all assigned offsets.", streamName);
+          logger.info("Stream {} has written all assigned offsets.", streamName);
           finaliseAndCommitStream(stream);
-          logger.trace("Stream {} is now committed.", streamName);
+          logger.info("Stream {} is now committed.", streamName);
           return;
         }
       }
-      logger.trace("Stream {} has not written all assigned offsets.", streamName);
+      logger.info("Stream {} has not written all assigned offsets.", streamName);
     }
-    logger.trace("Stream {} on table {} is not eligible for commit yet", streamName, tableName);
+    logger.info("Stream {} on table {} is not eligible for commit yet", streamName, tableName);
   }
 
   private void updateSuccessAndTryCommit(ApplicationStream applicationStream, TableName tableName, String streamName) {
+    logger.info("updating success and trying to commit");
     applicationStream.increaseCompletedCalls();
     commitStreamIfEligible(tableName.toString(), streamName);
   }
