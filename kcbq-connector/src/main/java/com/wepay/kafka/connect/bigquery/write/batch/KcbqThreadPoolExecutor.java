@@ -72,10 +72,7 @@ public class KcbqThreadPoolExecutor extends ThreadPoolExecutor {
     super.afterExecute(runnable, throwable);
 
     if (throwable != null && !(throwable instanceof ExpectedInterruptException)) {
-      // Log at debug level since this will be shown to the user at error level by the Connect framework if it causes
-      // the task to fail, and will otherwise just pollute logs and potentially mislead users
-      logger.debug("A write thread has failed with an unrecoverable error", throwable);
-      encounteredError.compareAndSet(null, throwable);
+      reportError(throwable);
     }
   }
 
@@ -110,5 +107,12 @@ public class KcbqThreadPoolExecutor extends ThreadPoolExecutor {
     Optional.ofNullable(encounteredError.get()).ifPresent(t -> {
       throw new BigQueryConnectException("A write thread has failed with an unrecoverable error", t);
     });
+  }
+
+  public void reportError(Throwable throwable) {
+    // Log at debug level since this will be shown to the user at error level by the Connect framework if it causes
+    // the task to fail, and will otherwise just pollute logs and potentially mislead users
+    logger.debug("A write thread has failed with an unrecoverable error", throwable);
+    encounteredError.compareAndSet(null, throwable);
   }
 }

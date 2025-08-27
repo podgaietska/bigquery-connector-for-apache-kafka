@@ -45,6 +45,8 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
+
+import com.wepay.kafka.connect.bigquery.write.batch.KcbqThreadPoolExecutor;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.sink.SinkRecord;
@@ -82,21 +84,23 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
   protected ConcurrentMap<ApplicationStream, Object> streamLocks;
 
   public StorageWriteApiBatchApplicationStream(
-      int retry,
-      long retryWait,
-      BigQueryWriteSettings writeSettings,
-      boolean autoCreateTables,
-      ErrantRecordHandler errantRecordHandler,
-      SchemaManager schemaManager,
-      boolean attemptSchemaUpdate) {
+          int retry,
+          long retryWait,
+          BigQueryWriteSettings writeSettings,
+          boolean autoCreateTables,
+          ErrantRecordHandler errantRecordHandler,
+          SchemaManager schemaManager,
+          boolean attemptSchemaUpdate,
+          KcbqThreadPoolExecutor executor) {
     super(
-        retry,
-        retryWait,
-        writeSettings,
-        autoCreateTables,
-        errantRecordHandler,
-        schemaManager,
-        attemptSchemaUpdate
+            retry,
+            retryWait,
+            writeSettings,
+            autoCreateTables,
+            errantRecordHandler,
+            schemaManager,
+            attemptSchemaUpdate,
+            executor
     );
     streams = new ConcurrentHashMap<>();
     currentStreams = new ConcurrentHashMap<>();

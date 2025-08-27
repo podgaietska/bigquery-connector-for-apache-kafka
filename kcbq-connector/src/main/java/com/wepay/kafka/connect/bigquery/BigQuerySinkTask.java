@@ -116,12 +116,14 @@ public class BigQuerySinkTask extends SinkTask {
   private volatile boolean stopped;
   private TopicPartitionManager topicPartitionManager;
   private KcbqThreadPoolExecutor executor;
+  private ExecutorService storageApiExecutor;
   private int remainingRetries;
   private boolean enableRetries;
   private ErrantRecordHandler errantRecordHandler;
   private boolean useStorageApi;
   private boolean useStorageApiBatchMode;
-  private StorageWriteApiBase storageApiWriter;
+  private StorageWriteApiBase storageApiBase;
+  private StorageWriteApiWriter storageApiWriter;
   private StorageApiBatchModeHandler batchHandler;
   private boolean autoCreateTables;
   private int retry;
@@ -201,6 +203,10 @@ public class BigQuerySinkTask extends SinkTask {
       Map<TopicPartition, OffsetAndMetadata> result = batchHandler.getCommitableOffsets();
       logger.debug("Commitable Offsets for storage api batch mode : " + result.toString());
       return result;
+    } else if (useStorageApi) {
+      Map<TopicPartition, OffsetAndMetadata> result = storageApiWriter.getCommittableOffsets(offsets);
+      logger.debug("Commitable Offsets for storage api default mode : " + result.toString());
+      return result;
     }
 
     flush(offsets);
@@ -268,6 +274,9 @@ public class BigQuerySinkTask extends SinkTask {
 
     // add tableWriters to the executor work queue
     for (TableWriterBuilder builder : tableWriterBuilders.values()) {
+      if (useStorageApi) {
+        storageApiExecutor.execute(builder.build());
+      }
       executor.execute(builder.build());
     }
 
@@ -458,6 +467,7 @@ public class BigQuerySinkTask extends SinkTask {
         new LinkedBlockingQueue<>(),
         new MdcContextThreadFactory()
     );
+    storageApiExecutor = Executors.newSingleThreadExecutor();
     topicPartitionManager = new TopicPartitionManager();
     recordTableResolver = new RecordTableResolver(config, mergeBatches, getBigQuery(), upsertDelete, useStorageApiBatchMode);
 
@@ -479,7 +489,7 @@ public class BigQuerySinkTask extends SinkTask {
   private void initializeStorageApiMode() {
     if (testStorageWriteApi != null) {
       logger.info("Starting task with Test Storage Write API Stream");
-      storageApiWriter = testStorageWriteApi;
+      storageApiBase = testStorageWriteApi;
       batchHandler = testStorageApiBatchHandler;
       if (loadExecutor == null) {
         loadExecutor = Executors.newScheduledThreadPool(1, new MdcContextThreadFactory());
@@ -497,9 +507,10 @@ public class BigQuerySinkTask extends SinkTask {
             autoCreateTables,
             errantRecordHandler,
             getSchemaManager(),
-            attemptSchemaUpdate
+            attemptSchemaUpdate,
+            executor
         );
-        storageApiWriter = writer;
+        storageApiBase = writer;
 
         logger.info("Starting task with Storage Write API Batch Mode");
         batchHandler = new StorageApiBatchModeHandler(writer, config);
@@ -510,16 +521,18 @@ public class BigQuerySinkTask extends SinkTask {
         loadExecutor.scheduleAtFixedRate(this::batchLoadExecutorRunnable, commitInterval, commitInterval, TimeUnit.SECONDS);
       } else {
         logger.info("Starting task with Storage Write API Default Stream");
-        storageApiWriter = new StorageWriteApiDefaultStream(
+        storageApiBase = new StorageWriteApiDefaultStream(
             retry,
             retryWait,
             writeSettings,
             autoCreateTables,
             errantRecordHandler,
             getSchemaManager(),
-            attemptSchemaUpdate
+            attemptSchemaUpdate,
+            executor
         );
       }
+      storageApiWriter = new StorageWriteApiWriter(storageApiBase, executor);
     }
   }
 
@@ -583,6 +596,7 @@ public class BigQuerySinkTask extends SinkTask {
   @Override
   public void stop() {
     try {
+      storageApiWriter.stopDrainer();
       maybeStopExecutor(loadExecutor, "load executor");
       maybeStopExecutor(executor, "table write executor");
       if (upsertDelete) {
@@ -591,8 +605,10 @@ public class BigQuerySinkTask extends SinkTask {
           getBigQuery().delete(table);
         });
       } else if (useStorageApi) {
-        storageApiWriter.shutdown();
+        storageApiBase.shutdown();
       }
+    } catch (InterruptedException e) {
+      throw new RuntimeException(e);
     } finally {
       stopped = true;
     }
