@@ -43,6 +43,7 @@ import com.wepay.kafka.connect.bigquery.utils.PartitionedTableId;
 import com.wepay.kafka.connect.bigquery.utils.TableNameUtils;
 import com.wepay.kafka.connect.bigquery.utils.Time;
 import com.wepay.kafka.connect.bigquery.write.RecordBatches;
+import com.wepay.kafka.connect.bigquery.write.batch.KcbqThreadPoolExecutor;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -53,8 +54,6 @@ import java.util.Map;
 import java.util.concurrent.Executor;
 import java.util.function.Function;
 import java.util.stream.Collectors;
-
-import com.wepay.kafka.connect.bigquery.write.batch.KcbqThreadPoolExecutor;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.json.JSONArray;
 import org.slf4j.Logger;
@@ -145,19 +144,19 @@ public abstract class StorageWriteApiBase {
           List<ConvertedRecord> rows,
           String streamName
   ) {
-    TableName tableName = TableNameUtils.tableName(table.getFullTableId());
     logger.debug("Sending {} records to Storage Write Api stream {}", rows.size(), streamName);
     StorageWriteApiRetryHandler retryHandler =
             new StorageWriteApiRetryHandler(table.getBaseTableId(), getSinkRecords(rows), retry, retryWait, time);
     logger.info("getting writer");
     StreamWriter writer = streamWriter(table, streamName, rows);
-    ApiFuture<Void> writeBatchesApiFuture = writeBatches(writer, new RecordBatches<>(rows), retryHandler, tableName);
+    ApiFuture<Void> writeBatchesApiFuture = writeBatches(writer, new RecordBatches<>(rows), retryHandler, table);
 
     return ApiFutures.transform(
             writeBatchesApiFuture,
             ignored -> {
               logger.info("about to call on success");
-              writer.onSuccess(); return null;
+              writer.onSuccess();
+              return null;
             },
             executor
     );
@@ -182,7 +181,7 @@ public abstract class StorageWriteApiBase {
             appendRowsApiFuture,
             Exception.class,
             e -> {
-              Function<Map<Integer,String>, ApiFuture<Void>> handleBatchFiltering = rowErrors -> {
+              Function<Map<Integer, String>, ApiFuture<Void>> handleBatchFiltering = rowErrors -> {
                 List<ConvertedRecord> remaining =
                         maybeHandleDlqRoutingAndFilterRecords(batch, rowErrors, table.getBaseTableId().getTable());
                 if (remaining.isEmpty()) {
@@ -222,7 +221,7 @@ public abstract class StorageWriteApiBase {
               if (batches.completed()) {
                 return ApiFutures.immediateFuture(null);
               }
-              return writeBatches(writer, batches, retryHandler, tableName);
+              return writeBatches(writer, batches, retryHandler, table);
             },
             executor
     );
@@ -240,12 +239,12 @@ public abstract class StorageWriteApiBase {
     try {
       appendRowsApiFuture = writer.appendRows(json);
     } catch (Exception e) {
-      if (shouldHandleSchemaMismatch(e))
-      {
+      if (shouldHandleSchemaMismatch(e)) {
         return ApiFutures.transformAsync(
                 runAsync(() -> retryHandler.attemptTableOperation(schemaManager::updateSchema), executor),
                 ignored -> ApiFutures.immediateFailedFuture(new RetryException()),
-                executor );
+                executor
+        );
       }
       return ApiFutures.immediateFailedFuture(e);
     }
@@ -270,9 +269,7 @@ public abstract class StorageWriteApiBase {
       try {
         r.run();
         f.set(null);
-      }
-      catch (Throwable t)
-      {
+      } catch (Throwable t) {
         f.setException(t);
       }
     });

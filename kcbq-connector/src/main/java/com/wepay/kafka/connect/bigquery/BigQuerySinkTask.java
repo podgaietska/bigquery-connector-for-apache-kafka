@@ -41,6 +41,7 @@ import com.wepay.kafka.connect.bigquery.exception.BigQueryStorageWriteApiConnect
 import com.wepay.kafka.connect.bigquery.exception.ConversionConnectException;
 import com.wepay.kafka.connect.bigquery.utils.PartitionedTableId;
 import com.wepay.kafka.connect.bigquery.utils.SinkRecordConverter;
+import com.wepay.kafka.connect.bigquery.utils.TableNameUtils;
 import com.wepay.kafka.connect.bigquery.utils.Time;
 import com.wepay.kafka.connect.bigquery.write.batch.GcsBatchTableWriter;
 import com.wepay.kafka.connect.bigquery.write.batch.KcbqThreadPoolExecutor;
@@ -52,6 +53,7 @@ import com.wepay.kafka.connect.bigquery.write.row.BigQueryWriter;
 import com.wepay.kafka.connect.bigquery.write.row.GcsToBqWriter;
 import com.wepay.kafka.connect.bigquery.write.row.SimpleBigQueryWriter;
 import com.wepay.kafka.connect.bigquery.write.row.UpsertDeleteBigQueryWriter;
+import com.wepay.kafka.connect.bigquery.write.storage.PartitionedTableWriterBuilder;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageApiBatchModeHandler;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiBase;
 import com.wepay.kafka.connect.bigquery.write.storage.StorageWriteApiBatchApplicationStream;
@@ -116,7 +118,6 @@ public class BigQuerySinkTask extends SinkTask {
   private volatile boolean stopped;
   private TopicPartitionManager topicPartitionManager;
   private KcbqThreadPoolExecutor executor;
-  private ExecutorService storageApiExecutor;
   private int remainingRetries;
   private boolean enableRetries;
   private ErrantRecordHandler errantRecordHandler;
@@ -230,7 +231,7 @@ public class BigQuerySinkTask extends SinkTask {
           if (useStorageApi) {
             tableWriterBuilder = new StorageWriteApiWriter.Builder(
                 storageApiWriter,
-                table,
+                TableNameUtils.tableName(table.getBaseTableId()),
                 recordConverter,
                 batchHandler
             );
@@ -260,7 +261,13 @@ public class BigQuerySinkTask extends SinkTask {
           tableWriterBuilders.put(table, tableWriterBuilder);
         }
         try {
-          tableWriterBuilders.get(table).addRow(record, table.getBaseTableId());
+          TableWriterBuilder tableWriterBuilder = tableWriterBuilders.get(table);
+          if (tableWriterBuilder instanceof PartitionedTableWriterBuilder) {
+            PartitionedTableWriterBuilder partitionedTableWriterBuilder = (PartitionedTableWriterBuilder) tableWriterBuilder;
+            partitionedTableWriterBuilder.addRow(record, table);
+          } else {
+            tableWriterBuilder.addRow(record, table.getFullTableId());
+          }
         } catch (ConversionConnectException ex) {
           // Send records to DLQ in case of ConversionConnectException
           if (errantRecordHandler.getErrantRecordReporter() != null) {
@@ -275,9 +282,10 @@ public class BigQuerySinkTask extends SinkTask {
     // add tableWriters to the executor work queue
     for (TableWriterBuilder builder : tableWriterBuilders.values()) {
       if (useStorageApi) {
-        storageApiExecutor.execute(builder.build());
+        builder.build().run();
+      } else {
+        executor.execute(builder.build());
       }
-      executor.execute(builder.build());
     }
 
     // check if we should pause topics
@@ -467,7 +475,6 @@ public class BigQuerySinkTask extends SinkTask {
         new LinkedBlockingQueue<>(),
         new MdcContextThreadFactory()
     );
-    storageApiExecutor = Executors.newSingleThreadExecutor();
     topicPartitionManager = new TopicPartitionManager();
     recordTableResolver = new RecordTableResolver(config, mergeBatches, getBigQuery(), upsertDelete, useStorageApiBatchMode);
 
