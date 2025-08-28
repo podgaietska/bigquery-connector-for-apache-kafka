@@ -27,6 +27,7 @@ import static com.wepay.kafka.connect.bigquery.utils.TableNameUtils.intTable;
 
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.InsertAllRequest.RowToInsert;
+import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.TimePartitioning;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteSettings;
 import com.google.cloud.storage.Bucket;
@@ -221,19 +222,20 @@ public class BigQuerySinkTask extends SinkTask {
     logger.debug("Putting {} records in the sink.", records.size());
 
     // create tableWriters
-    Map<PartitionedTableId, TableWriterBuilder> tableWriterBuilders = new HashMap<>();
+    Map<TableId, TableWriterBuilder> tableWriterBuilders = new HashMap<>();
 
     for (SinkRecord record : records) {
       if (record.value() != null || config.getBoolean(BigQuerySinkConfig.DELETE_ENABLED_CONFIG)) {
         PartitionedTableId table = recordTableResolver.getRecordTable(record);
-        if (!tableWriterBuilders.containsKey(table)) {
-          TableWriterBuilder tableWriterBuilder;
+        TableId tableId = (useStorageApi) ? table.getBaseTableId() : table.getFullTableId();
+
+        final TableWriterBuilder tableWriterBuilder = tableWriterBuilders.computeIfAbsent(tableId, t -> {
           if (useStorageApi) {
-            tableWriterBuilder = new StorageWriteApiWriter.Builder(
-                storageApiWriter,
-                TableNameUtils.tableName(table.getBaseTableId()),
-                recordConverter,
-                batchHandler
+            return new StorageWriteApiWriter.Builder(
+              storageApiWriter,
+              TableNameUtils.tableName(table.getBaseTableId()),
+              recordConverter,
+              batchHandler
             );
           } else if (config.getList(BigQuerySinkConfig.ENABLE_BATCH_CONFIG).contains(record.topic())) {
             String topic = record.topic();
@@ -243,30 +245,28 @@ public class BigQuerySinkTask extends SinkTask {
             if (gcsFolderName != null && !"".equals(gcsFolderName)) {
               gcsBlobName = gcsFolderName + "/" + gcsBlobName;
             }
-            tableWriterBuilder = new GcsBatchTableWriter.Builder(
-                gcsToBqWriter,
-                table.getBaseTableId(),
-                config.getString(BigQuerySinkConfig.GCS_BUCKET_NAME_CONFIG),
-                gcsBlobName,
-                recordConverter);
+            return new GcsBatchTableWriter.Builder(
+                    gcsToBqWriter,
+                    table.getBaseTableId(),
+                    config.getString(BigQuerySinkConfig.GCS_BUCKET_NAME_CONFIG),
+                    gcsBlobName,
+                    recordConverter);
           } else {
             TableWriter.Builder simpleTableWriterBuilder =
-                new TableWriter.Builder(bigQueryWriter, table, recordConverter);
+                    new TableWriter.Builder(bigQueryWriter, table, recordConverter);
             if (upsertDelete) {
               simpleTableWriterBuilder.onFinish(rows ->
-                  mergeBatches.onRowWrites(table.getBaseTableId(), rows));
+                      mergeBatches.onRowWrites(table.getBaseTableId(), rows));
             }
-            tableWriterBuilder = simpleTableWriterBuilder;
+            return simpleTableWriterBuilder;
           }
-          tableWriterBuilders.put(table, tableWriterBuilder);
-        }
+        });
+
         try {
-          TableWriterBuilder tableWriterBuilder = tableWriterBuilders.get(table);
           if (tableWriterBuilder instanceof PartitionedTableWriterBuilder) {
-            PartitionedTableWriterBuilder partitionedTableWriterBuilder = (PartitionedTableWriterBuilder) tableWriterBuilder;
-            partitionedTableWriterBuilder.addRow(record, table);
+            ((PartitionedTableWriterBuilder) tableWriterBuilder).addRow(record, table);
           } else {
-            tableWriterBuilder.addRow(record, table.getFullTableId());
+            tableWriterBuilder.addRow(record, tableId);
           }
         } catch (ConversionConnectException ex) {
           // Send records to DLQ in case of ConversionConnectException
@@ -279,16 +279,16 @@ public class BigQuerySinkTask extends SinkTask {
       }
     }
 
-    // add tableWriters to the executor work queue
-    for (TableWriterBuilder builder : tableWriterBuilders.values()) {
-      if (useStorageApi) {
-        builder.build().run();
-      } else {
-        executor.execute(builder.build());
+    if (useStorageApi) {
+      for (TableWriterBuilder b : tableWriterBuilders.values()) {
+        b.build().run();
+      }
+    } else {
+      for (TableWriterBuilder b : tableWriterBuilders.values()) {
+        executor.execute(b.build());
       }
     }
 
-    // check if we should pause topics
     checkQueueSize();
   }
 
