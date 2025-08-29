@@ -139,7 +139,7 @@ public abstract class StorageWriteApiBase {
    *                   Pre-conversion sink records are required for DLQ routing
    * @param streamName The stream to use to write table to table.
    */
-  protected ApiFuture<Void> initializeAndWriteRecords(
+  public ApiFuture<Void> initializeAndWriteRecords(
           PartitionedTableId table,
           List<ConvertedRecord> rows,
           String streamName

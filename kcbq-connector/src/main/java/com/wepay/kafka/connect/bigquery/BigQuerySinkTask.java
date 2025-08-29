@@ -74,6 +74,7 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
@@ -216,6 +217,10 @@ public class BigQuerySinkTask extends SinkTask {
   }
 
   private void writeSinkRecords(Collection<SinkRecord> records) {
+    if (stopped) {
+      throw new RejectedExecutionException("BigQuerySinkTask is stopped");
+    }
+
     // Periodically poll for errors here instead of doing a stop-the-world check in flush()
     maybeThrowErrors();
 
@@ -280,12 +285,12 @@ public class BigQuerySinkTask extends SinkTask {
     }
 
     if (useStorageApi) {
-      for (TableWriterBuilder b : tableWriterBuilders.values()) {
-        b.build().run();
+      for (TableWriterBuilder tableWriterBuilder : tableWriterBuilders.values()) {
+        tableWriterBuilder.build().run();
       }
     } else {
-      for (TableWriterBuilder b : tableWriterBuilders.values()) {
-        executor.execute(b.build());
+      for (TableWriterBuilder tableWriterBuilder : tableWriterBuilders.values()) {
+        executor.execute(tableWriterBuilder.build());
       }
     }
 
@@ -497,7 +502,7 @@ public class BigQuerySinkTask extends SinkTask {
     if (testStorageWriteApi != null) {
       logger.info("Starting task with Test Storage Write API Stream");
       storageApiBase = testStorageWriteApi;
-      batchHandler = testStorageApiBatchHandler;
+      batchHandler = useStorageApiBatchMode ? testStorageApiBatchHandler : null;
       if (loadExecutor == null) {
         loadExecutor = Executors.newScheduledThreadPool(1, new MdcContextThreadFactory());
       }
@@ -539,8 +544,8 @@ public class BigQuerySinkTask extends SinkTask {
             executor
         );
       }
-      storageApiWriter = new StorageWriteApiWriter(storageApiBase, executor);
     }
+    storageApiWriter = new StorageWriteApiWriter(storageApiBase, executor);
   }
 
   private void batchLoadExecutorRunnable() {
@@ -603,7 +608,6 @@ public class BigQuerySinkTask extends SinkTask {
   @Override
   public void stop() {
     try {
-      storageApiWriter.stopDrainer();
       maybeStopExecutor(loadExecutor, "load executor");
       maybeStopExecutor(executor, "table write executor");
       if (upsertDelete) {
@@ -612,6 +616,7 @@ public class BigQuerySinkTask extends SinkTask {
           getBigQuery().delete(table);
         });
       } else if (useStorageApi) {
+        storageApiWriter.stopDrainer();
         storageApiBase.shutdown();
       }
     } catch (InterruptedException e) {
