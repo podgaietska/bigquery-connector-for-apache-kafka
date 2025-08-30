@@ -23,75 +23,187 @@
 
 package com.wepay.kafka.connect.bigquery.write.storage;
 
+import com.google.api.core.ApiFuture;
 import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.storage.v1.TableName;
-import com.wepay.kafka.connect.bigquery.api.KafkaSchemaRecordType;
-import com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig;
-import com.wepay.kafka.connect.bigquery.config.BigQuerySinkTaskConfig;
-import com.wepay.kafka.connect.bigquery.convert.KafkaDataBuilder;
-import com.wepay.kafka.connect.bigquery.convert.RecordConverter;
-import com.wepay.kafka.connect.bigquery.utils.FieldNameSanitizer;
 import com.wepay.kafka.connect.bigquery.utils.SinkRecordConverter;
+import com.wepay.kafka.connect.bigquery.write.batch.KcbqThreadPoolExecutor;
 import com.wepay.kafka.connect.bigquery.write.batch.TableWriterBuilder;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
+import javax.annotation.Nullable;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.json.JSONArray;
 import org.json.JSONObject;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Storage Write API writer that attempts to write all the rows it is given at once
  */
-public class StorageWriteApiWriter implements Runnable {
+public class StorageWriteApiWriter {
+  private final KcbqThreadPoolExecutor executor;
+  private final Thread drainer = new Thread(this::drainHeadLoop);
+  private volatile boolean running = true;
+  private final ConcurrentLinkedQueue<AppendRowsAttempt> appendAttempts = new ConcurrentLinkedQueue<>();
 
-  public static final String DEFAULT = "default";
   private final StorageWriteApiBase streamWriter;
-  private final TableName tableName;
-  private final List<ConvertedRecord> records;
-  private final String streamName;
-  Logger logger = LoggerFactory.getLogger(StorageWriteApiWriter.class);
 
-  /**
-   * @param tableName    The table to write the records to
-   * @param streamWriter The stream writer to use - Default, Batch etc
-   * @param records      The records to write
-   * @param streamName   The stream to use while writing data
-   */
-  public StorageWriteApiWriter(TableName tableName, StorageWriteApiBase streamWriter, List<ConvertedRecord> records, String streamName) {
+  public StorageWriteApiWriter(StorageWriteApiBase streamWriter,
+                                    KcbqThreadPoolExecutor executor) {
     this.streamWriter = streamWriter;
-    this.records = records;
-    this.tableName = tableName;
-    this.streamName = streamName;
+    this.executor = executor;
+    startDrainer();
   }
 
-  @Override
-  public void run() {
-    if (records.size() == 0) {
-      logger.debug("There are no records, skipping");
-      return;
+  void sendAppendRowsRequest(List<ConvertedRecord> batch, TableName tableName, String streamName) {
+    try {
+      ApiFuture<Void> appendRowsResponseApiFuture =
+              streamWriter.initializeAndWriteRecords(tableName, batch, streamName);
+      Map<TopicPartition, Long> minOffsetsByTp = computeMinOffsetsPerTp(batch);
+      appendAttempts.add(new AppendRowsAttempt(appendRowsResponseApiFuture, minOffsetsByTp));
+    } catch (Throwable t) {
+      reportTerminal(t);
     }
-    logger.debug("Putting {} records into {} stream", records.size(), streamName);
-    streamWriter.initializeAndWriteRecords(tableName, records, streamName);
   }
+
+  private void drainHeadLoop() {
+    final long sleep = TimeUnit.MICROSECONDS.toNanos(200);
+    try {
+      while (running) {
+        AppendRowsAttempt head = appendAttempts.peek();
+        if (head == null) {
+          LockSupport.parkNanos(sleep);
+          continue;
+        }
+        if (!head.future.isDone()) {
+          LockSupport.parkNanos(sleep);
+          continue;
+        }
+        try {
+          head.future.get();
+        } catch (Exception e) {
+          reportTerminal(e);
+        }
+        appendAttempts.poll();
+      }
+    } catch (Throwable t) {
+      reportTerminal(t);
+    }
+  }
+
+  public void startDrainer() {
+    drainer.setDaemon(true);
+    drainer.start();
+  }
+
+  public void stopDrainer() throws InterruptedException {
+    running = false;
+    drainer.join(2000);
+  }
+
+  private Map<TopicPartition, Long> computeMinOffsetsPerTp(List<ConvertedRecord> batch) {
+    Map<TopicPartition, Long> minOffsetForTp = new HashMap<>();
+    for (ConvertedRecord record : batch) {
+      SinkRecord originalRecord = record.original();
+      TopicPartition tp = new TopicPartition(originalRecord.topic(), originalRecord.kafkaPartition());
+      long offset = originalRecord.kafkaOffset();
+      minOffsetForTp.merge(tp, offset, Math::min);
+    }
+    return minOffsetForTp;
+  }
+
+  public Map<TopicPartition, OffsetAndMetadata> getCommittableOffsets(
+          Map<TopicPartition, OffsetAndMetadata> offsetsToCommit) {
+
+    final Map<TopicPartition, Long> minPendingOffset = new HashMap<>(offsetsToCommit.size());
+    final Set<TopicPartition> unresolved = new HashSet<>(offsetsToCommit.keySet());
+    final Map<TopicPartition, Long> tpBoundary = new HashMap<>(offsetsToCommit.size());
+    offsetsToCommit.forEach((tp, om) -> tpBoundary.put(tp, om.offset() - 1L));
+
+    for (AppendRowsAttempt attempt : appendAttempts) {
+      final boolean done = attempt.future.isDone();
+      if (done) {
+        try {
+          attempt.future.get();
+        } catch (Exception ex) {
+          reportTerminal(ex);
+        }
+        executor.maybeThrowEncounteredError();
+      }
+
+      for (Map.Entry<TopicPartition, Long> e : attempt.minOffsetByTp.entrySet()) {
+        final TopicPartition tp = e.getKey();
+        if (!unresolved.contains(tp)) {
+          continue;
+        }
+
+        final Long minOffsetInAttempt = e.getValue();
+        final long boundary = tpBoundary.get(tp);
+
+        if (minOffsetInAttempt > boundary) {
+          // first attempt we see for this TP starts beyond boundary so (regardless of done/pending)
+          unresolved.remove(tp);
+        } else if (!done) {
+          // pending overlap: block this TP, commit value will be minInAttempt
+          minPendingOffset.put(tp, minOffsetInAttempt);
+          unresolved.remove(tp);
+        }
+        // else if done & min ≤ b: already written; keep TP unresolved and keep scanning
+      }
+
+      if (unresolved.isEmpty()) {
+        break; // early exit cuz all committable offsets for TPs have been decided
+      }
+    }
+
+    // Build the result: if TP has a pending overlap, commit just before it (commit value = min);
+    // otherwise, commit exactly what Kafka asked for.
+    Map<TopicPartition, OffsetAndMetadata> safeToCommit = new HashMap<>(offsetsToCommit.size());
+
+    for (Map.Entry<TopicPartition, OffsetAndMetadata> requested : offsetsToCommit.entrySet()) {
+      TopicPartition tp = requested.getKey();
+      final Long pendingMin = minPendingOffset.get(tp);
+
+      if (pendingMin != null) {
+        // Safe last-written is pendingMin - 1, so commit value (next offset) is pendingMin
+        safeToCommit.put(tp, new OffsetAndMetadata(pendingMin));
+      } else {
+        // No pending overlap at/below boundary so we can grant Kafka’s requested commit
+        safeToCommit.put(tp, requested.getValue());
+      }
+    }
+
+    return safeToCommit;
+  }
+
+  void reportTerminal(Throwable throwable) {
+    executor.reportError(throwable);
+  }
+
 
   public static class Builder implements TableWriterBuilder {
     private final List<ConvertedRecord> records = new ArrayList<>();
     private final SinkRecordConverter recordConverter;
     private final TableName tableName;
-    private final StorageWriteApiBase streamWriter;
     private final StorageApiBatchModeHandler batchModeHandler;
+    private final StorageWriteApiWriter asyncWriter;
 
-    public Builder(StorageWriteApiBase streamWriter,
-                   TableName tableName,
+    public Builder(TableName tableName,
                    SinkRecordConverter recordConverter,
-                   StorageApiBatchModeHandler batchModeHandler) {
-      this.streamWriter = streamWriter;
+                   StorageWriteApiWriter asyncWriter,
+                   @Nullable StorageApiBatchModeHandler batchModeHandler) {
       this.tableName = tableName;
       this.recordConverter = recordConverter;
       this.batchModeHandler = batchModeHandler;
+      this.asyncWriter = asyncWriter;
     }
 
     /**
@@ -120,11 +232,10 @@ public class StorageWriteApiWriter implements Runnable {
      */
     @Override
     public Runnable build() {
-      String streamName = DEFAULT;
-      if (records.size() > 0 && streamWriter instanceof StorageWriteApiBatchApplicationStream) {
-        streamName = batchModeHandler.updateOffsetsOnStream(tableName.toString(), records);
-      }
-      return new StorageWriteApiWriter(tableName, streamWriter, records, streamName);
+      final String streamName = (batchModeHandler != null && !records.isEmpty())
+              ? batchModeHandler.updateOffsetsOnStream(tableName.toString(), records)
+              : "default";
+      return () -> asyncWriter.sendAppendRowsRequest(records, tableName, streamName);
     }
 
     private JSONObject getJsonFromMap(Map<String, Object> map) {
@@ -146,6 +257,16 @@ public class StorageWriteApiWriter implements Runnable {
         jsonObject.put(key, value);
       });
       return jsonObject;
+    }
+  }
+
+  private static class AppendRowsAttempt {
+    final ApiFuture<Void> future;
+    final Map<TopicPartition, Long> minOffsetByTp;
+
+    AppendRowsAttempt(ApiFuture<Void> future, Map<TopicPartition, Long> minOffsetByTp) {
+      this.future = future;
+      this.minOffsetByTp = minOffsetByTp;
     }
   }
 }

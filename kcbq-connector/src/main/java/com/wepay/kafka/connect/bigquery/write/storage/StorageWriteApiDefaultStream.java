@@ -33,6 +33,7 @@ import com.google.protobuf.Descriptors;
 import com.wepay.kafka.connect.bigquery.ErrantRecordHandler;
 import com.wepay.kafka.connect.bigquery.SchemaManager;
 import com.wepay.kafka.connect.bigquery.exception.BigQueryStorageWriteApiConnectException;
+import com.wepay.kafka.connect.bigquery.write.batch.KcbqThreadPoolExecutor;
 import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
@@ -54,15 +55,17 @@ public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
                                       boolean autoCreateTables,
                                       ErrantRecordHandler errantRecordHandler,
                                       SchemaManager schemaManager,
-                                      boolean attemptSchemaUpdate) {
+                                      boolean attemptSchemaUpdate,
+                                      KcbqThreadPoolExecutor executor) {
     super(
-        retry,
-        retryWait,
-        writeSettings,
-        autoCreateTables,
-        errantRecordHandler,
-        schemaManager,
-        attemptSchemaUpdate
+            retry,
+            retryWait,
+            writeSettings,
+            autoCreateTables,
+            errantRecordHandler,
+            schemaManager,
+            attemptSchemaUpdate,
+            executor
     );
   }
 
@@ -107,9 +110,9 @@ public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
           return jsonWriterFactory.create(tableName);
         } catch (Exception e) {
           String baseErrorMessage = String.format(
-              "Failed to create Default stream writer on table %s due to %s",
-              tableName,
-              e.getMessage());
+                  "Failed to create Default stream writer on table %s due to %s",
+                  tableName,
+                  e.getMessage());
           retryHandler.setMostRecentException(new BigQueryStorageWriteApiConnectException(baseErrorMessage, e));
           if (shouldHandleTableCreation(e.getMessage())) {
             retryHandler.attemptTableOperation(schemaManager::createTable);
@@ -125,9 +128,9 @@ public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
 
   @Override
   protected StreamWriter streamWriter(
-      TableName tableName,
-      String streamName,
-      List<ConvertedRecord> records
+          TableName tableName,
+          String streamName,
+          List<ConvertedRecord> records
   ) {
     return new DefaultStreamWriter(tableName, records);
   }
@@ -145,7 +148,7 @@ public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
 
     @Override
     public ApiFuture<AppendRowsResponse> appendRows(
-        JSONArray rows
+            JSONArray rows
     ) throws Descriptors.DescriptorValidationException, IOException {
       if (jsonStreamWriter == null) {
         jsonStreamWriter = getDefaultStream(tableName, inputRows);
@@ -166,7 +169,7 @@ public class StorageWriteApiDefaultStream extends StorageWriteApiBase {
 
     @Override
     public String streamName() {
-      return StorageWriteApiWriter.DEFAULT;
+      return "default";
     }
   }
 

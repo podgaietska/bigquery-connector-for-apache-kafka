@@ -82,6 +82,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
@@ -138,6 +139,7 @@ public class BigQuerySinkTask extends SinkTask {
   private int retry;
   private long retryWait;
   private Map<String, PartitionedTableId> topicToPartitionTableId;
+  private StorageWriteApiWriter storageWriteApiWriter;
 
   private boolean allowNewBigQueryFields;
   private boolean useCredentialsProjectId;
@@ -184,10 +186,10 @@ public class BigQuerySinkTask extends SinkTask {
   public void flush(Map<TopicPartition, OffsetAndMetadata> offsets) {
     if (upsertDelete) {
       throw new ConnectException("This connector cannot perform upsert/delete on older versions of "
-          + "the Connect framework; please upgrade to version 0.10.2.0 or later");
+              + "the Connect framework; please upgrade to version 0.10.2.0 or later");
     } else if (useStorageApi && useStorageApiBatchMode) {
       throw new ConnectException("This connector cannot use batch mode for the Storage Write API "
-          + "on older versions of the Connect framework; please upgrade to version 0.10.2.0 or later");
+              + "on older versions of the Connect framework; please upgrade to version 0.10.2.0 or later");
     }
 
     // Return immediately here since the executor will already be shutdown
@@ -200,6 +202,7 @@ public class BigQuerySinkTask extends SinkTask {
 
     try {
       executor.awaitCurrentTasks();
+      executor.maybeThrowEncounteredError();
     } catch (InterruptedException err) {
       throw new ConnectException("Interrupted while waiting for write tasks to complete.", err);
     }
@@ -216,6 +219,10 @@ public class BigQuerySinkTask extends SinkTask {
     } else if (useStorageApiBatchMode) {
       Map<TopicPartition, OffsetAndMetadata> result = batchHandler.getCommitableOffsets();
       logger.debug("Commitable Offsets for storage api batch mode : " + result.toString());
+      return result;
+    } else if (useStorageApi) {
+      Map<TopicPartition, OffsetAndMetadata> result = storageWriteApiWriter.getCommittableOffsets(offsets);
+      logger.debug("Commitable Offsets for storage api default mode : " + result.toString());
       return result;
     }
 
@@ -256,8 +263,8 @@ public class BigQuerySinkTask extends SinkTask {
       project = config.getString(BigQuerySinkConfig.PROJECT_CONFIG);
     }
     TableId baseTableId = project == null
-        ? TableId.of(dataset, tableName)
-        : TableId.of(project, dataset, tableName);
+            ? TableId.of(dataset, tableName)
+            : TableId.of(project, dataset, tableName);
     if (upsertDelete) {
       TableId intermediateTableId = mergeBatches.intermediateTableFor(baseTableId);
       // If upsert/delete is enabled, we want to stream into a non-partitioned intermediate table
@@ -278,7 +285,7 @@ public class BigQuerySinkTask extends SinkTask {
       if (useMessageTimeDatePartitioning) {
         if (record.timestampType() == TimestampType.NO_TIMESTAMP_TYPE) {
           throw new ConnectException(
-              "Message has no timestamp type, cannot use message timestamp to partition.");
+                  "Message has no timestamp type, cannot use message timestamp to partition.");
         }
         setTimePartitioningForTimestamp(baseTableId, builder, timePartitioning, record.timestamp());
       } else {
@@ -305,10 +312,10 @@ public class BigQuerySinkTask extends SinkTask {
           TableWriterBuilder tableWriterBuilder;
           if (useStorageApi) {
             tableWriterBuilder = new StorageWriteApiWriter.Builder(
-                storageApiWriter,
-                TableNameUtils.tableName(table.getBaseTableId()),
-                recordConverter,
-                batchHandler
+                    TableNameUtils.tableName(table.getBaseTableId()),
+                    recordConverter,
+                    storageWriteApiWriter,
+                    batchHandler
             );
           } else if (config.getList(BigQuerySinkConfig.ENABLE_BATCH_CONFIG).contains(record.topic())) {
             String topic = record.topic();
@@ -319,17 +326,17 @@ public class BigQuerySinkTask extends SinkTask {
               gcsBlobName = gcsFolderName + "/" + gcsBlobName;
             }
             tableWriterBuilder = new GcsBatchTableWriter.Builder(
-                gcsToBqWriter,
-                table.getBaseTableId(),
-                config.getString(BigQuerySinkConfig.GCS_BUCKET_NAME_CONFIG),
-                gcsBlobName,
-                recordConverter);
+                    gcsToBqWriter,
+                    table.getBaseTableId(),
+                    config.getString(BigQuerySinkConfig.GCS_BUCKET_NAME_CONFIG),
+                    gcsBlobName,
+                    recordConverter);
           } else {
             TableWriter.Builder simpleTableWriterBuilder =
-                new TableWriter.Builder(bigQueryWriter, table, recordConverter);
+                    new TableWriter.Builder(bigQueryWriter, table, recordConverter);
             if (upsertDelete) {
               simpleTableWriterBuilder.onFinish(rows ->
-                  mergeBatches.onRowWrites(table.getBaseTableId(), rows));
+                      mergeBatches.onRowWrites(table.getBaseTableId(), rows));
             }
             tableWriterBuilder = simpleTableWriterBuilder;
           }
@@ -350,7 +357,11 @@ public class BigQuerySinkTask extends SinkTask {
 
     // add tableWriters to the executor work queue
     for (TableWriterBuilder builder : tableWriterBuilders.values()) {
-      executor.execute(builder.build());
+      if (useStorageApi) {
+        builder.build().run();
+      } else {
+        executor.execute(builder.build());
+      }
     }
 
     // check if we should pause topics
@@ -389,10 +400,13 @@ public class BigQuerySinkTask extends SinkTask {
     long queueSoftLimit = config.getLong(BigQuerySinkConfig.QUEUE_SIZE_CONFIG);
     if (queueSoftLimit != -1) {
       int currentQueueSize = executor.getQueue().size();
+      logger.info("Current queue size: {}", currentQueueSize);
       if (currentQueueSize > queueSoftLimit) {
+        logger.info("Pausing partitions");
         topicPartitionManager.pauseAll();
       } else if (currentQueueSize <= queueSoftLimit / 2) {
         // resume only if there is a reasonable chance we won't immediately have to pause again.
+        logger.info("Resuming partitions");
         topicPartitionManager.resumeAll();
       }
     }
@@ -406,13 +420,13 @@ public class BigQuerySinkTask extends SinkTask {
   }
 
   private void setTimePartitioningForTimestamp(
-      TableId table, PartitionedTableId.Builder builder, TimePartitioning timePartitioning, Long timestamp
+          TableId table, PartitionedTableId.Builder builder, TimePartitioning timePartitioning, Long timestamp
   ) {
     if (timePartitioning.getType() != Type.DAY) {
       throw new ConnectException(String.format(
-          "Cannot use decorator syntax to write to %s as it is partitioned by %s and not by day",
-          TableNameUtils.table(table),
-          timePartitioning.getType().toString().toLowerCase()
+              "Cannot use decorator syntax to write to %s as it is partitioned by %s and not by day",
+              TableNameUtils.table(table),
+              timePartitioning.getType().toString().toLowerCase()
       ));
     }
     builder.setDayPartition(timestamp);
@@ -421,9 +435,9 @@ public class BigQuerySinkTask extends SinkTask {
   private void setTimePartitioning(TableId table, PartitionedTableId.Builder builder, TimePartitioning timePartitioning) {
     if (timePartitioning.getType() != Type.DAY) {
       throw new ConnectException(String.format(
-          "Cannot use decorator syntax to write to %s as it is partitioned by %s and not by day",
-          TableNameUtils.table(table),
-          timePartitioning.getType().toString().toLowerCase()
+              "Cannot use decorator syntax to write to %s as it is partitioned by %s and not by day",
+              TableNameUtils.table(table),
+              timePartitioning.getType().toString().toLowerCase()
       ));
     }
     builder.setDayPartitionForNow();
@@ -454,8 +468,8 @@ public class BigQuerySinkTask extends SinkTask {
 
   private BigQuery newBigQuery() {
     return new GcpClientBuilder.BigQueryBuilder()
-        .withConfig(config)
-        .build();
+            .withConfig(config)
+            .build();
   }
 
   private SchemaManager getSchemaManager() {
@@ -468,7 +482,7 @@ public class BigQuerySinkTask extends SinkTask {
   private SchemaManager newSchemaManager() {
     schemaRetriever = config.getSchemaRetriever();
     SchemaConverter<com.google.cloud.bigquery.Schema> schemaConverter =
-        config.getSchemaConverter();
+            config.getSchemaConverter();
     Optional<String> kafkaKeyFieldName = config.getKafkaKeyFieldName();
     Optional<String> kafkaDataFieldName = config.getKafkaDataFieldName();
     Optional<String> timestampPartitionFieldName = config.getTimestampPartitionFieldName();
@@ -478,31 +492,31 @@ public class BigQuerySinkTask extends SinkTask {
     boolean allowSchemaUnionization = config.getBoolean(BigQuerySinkConfig.ALLOW_SCHEMA_UNIONIZATION_CONFIG);
     boolean sanitizeFieldNames = config.getBoolean(BigQuerySinkConfig.SANITIZE_FIELD_NAME_CONFIG);
     return new SchemaManager(schemaRetriever, schemaConverter, getBigQuery(),
-        allowNewBigQueryFields, allowRequiredFieldRelaxation, allowSchemaUnionization,
-        sanitizeFieldNames,
-        kafkaKeyFieldName, kafkaDataFieldName,
-        timestampPartitionFieldName, partitionExpiration, clusteringFieldName, timePartitioningType);
+            allowNewBigQueryFields, allowRequiredFieldRelaxation, allowSchemaUnionization,
+            sanitizeFieldNames,
+            kafkaKeyFieldName, kafkaDataFieldName,
+            timestampPartitionFieldName, partitionExpiration, clusteringFieldName, timePartitioningType);
   }
 
   private BigQueryWriter getBigQueryWriter(ErrantRecordHandler errantRecordHandler) {
     BigQuery bigQuery = getBigQuery();
     if (upsertDelete) {
       return new UpsertDeleteBigQueryWriter(bigQuery,
-          getSchemaManager(),
-          retry,
-          retryWait,
-          autoCreateTables,
-          mergeBatches.intermediateToDestinationTables(),
-          errantRecordHandler,
-          time);
+              getSchemaManager(),
+              retry,
+              retryWait,
+              autoCreateTables,
+              mergeBatches.intermediateToDestinationTables(),
+              errantRecordHandler,
+              time);
     } else if (autoCreateTables || allowNewBigQueryFields || allowRequiredFieldRelaxation) {
       return new AdaptiveBigQueryWriter(bigQuery,
-          getSchemaManager(),
-          retry,
-          retryWait,
-          autoCreateTables,
-          errantRecordHandler,
-          time);
+              getSchemaManager(),
+              retry,
+              retryWait,
+              autoCreateTables,
+              errantRecordHandler,
+              time);
     } else {
       return new SimpleBigQueryWriter(bigQuery, retry, retryWait, errantRecordHandler, time);
     }
@@ -513,8 +527,8 @@ public class BigQuerySinkTask extends SinkTask {
       return testGcs;
     }
     return new GcpClientBuilder.GcsBuilder()
-        .withConfig(config)
-        .build();
+            .withConfig(config)
+            .build();
   }
 
   private GcsToBqWriter getGcsWriter() {
@@ -523,12 +537,12 @@ public class BigQuerySinkTask extends SinkTask {
     // needed.
     SchemaManager schemaManager = autoCreateTables ? getSchemaManager() : null;
     return new GcsToBqWriter(getGcs(),
-        bigQuery,
-        schemaManager,
-        retry,
-        retryWait,
-        autoCreateTables,
-        time);
+            bigQuery,
+            schemaManager,
+            retry,
+            retryWait,
+            autoCreateTables,
+            time);
   }
 
   private SinkRecordConverter getConverter(BigQuerySinkTaskConfig config) {
@@ -555,7 +569,7 @@ public class BigQuerySinkTask extends SinkTask {
     config = new BigQuerySinkTaskConfig(properties);
     autoCreateTables = config.getBoolean(BigQuerySinkConfig.TABLE_CREATE_CONFIG);
     upsertDelete = config.getBoolean(BigQuerySinkConfig.UPSERT_ENABLED_CONFIG)
-        || config.getBoolean(BigQuerySinkConfig.DELETE_ENABLED_CONFIG);
+            || config.getBoolean(BigQuerySinkConfig.DELETE_ENABLED_CONFIG);
 
     useCredentialsProjectId = config.getBoolean(BigQuerySinkConfig.USE_CREDENTIALS_PROJECT_ID_CONFIG);
     useStorageApi = config.getBoolean(BigQuerySinkConfig.USE_STORAGE_WRITE_API_CONFIG);
@@ -569,6 +583,7 @@ public class BigQuerySinkTask extends SinkTask {
     bigQuery = new AtomicReference<>();
     schemaManager = new AtomicReference<>();
 
+
     // Initialise errantRecordReporter
     ErrantRecordReporter errantRecordReporter = null;
     try {
@@ -576,16 +591,16 @@ public class BigQuerySinkTask extends SinkTask {
     } catch (NoClassDefFoundError | NullPointerException e) {
       // Will occur in Connect runtimes earlier than 2.6
       logger.warn("Connect versions prior to Apache Kafka 2.6 do not support the errant record "
-          + "reporter");
+              + "reporter");
     }
     errantRecordHandler = new ErrantRecordHandler(errantRecordReporter);
 
     if (upsertDelete) {
       String intermediateTableSuffix = String.format("_%s_%d_%s_%d",
-          config.getString(BigQuerySinkConfig.INTERMEDIATE_TABLE_SUFFIX_CONFIG),
-          config.getInt(BigQuerySinkTaskConfig.TASK_ID_CONFIG),
-          uuid,
-          Instant.now().toEpochMilli()
+              config.getString(BigQuerySinkConfig.INTERMEDIATE_TABLE_SUFFIX_CONFIG),
+              config.getInt(BigQuerySinkTaskConfig.TASK_ID_CONFIG),
+              uuid,
+              Instant.now().toEpochMilli()
       );
       mergeBatches = new MergeBatches(intermediateTableSuffix);
     }
@@ -594,20 +609,20 @@ public class BigQuerySinkTask extends SinkTask {
     bigQueryWriter = getBigQueryWriter(errantRecordHandler);
     gcsToBqWriter = getGcsWriter();
     executor = new KcbqThreadPoolExecutor(
-        config,
-        new LinkedBlockingQueue<>(),
-        new MdcContextThreadFactory()
+            config,
+            new LinkedBlockingQueue<>(),
+            new MdcContextThreadFactory()
     );
     topicPartitionManager = new TopicPartitionManager();
     useMessageTimeDatePartitioning =
-        config.getBoolean(BigQuerySinkConfig.BIGQUERY_MESSAGE_TIME_PARTITIONING_CONFIG);
+            config.getBoolean(BigQuerySinkConfig.BIGQUERY_MESSAGE_TIME_PARTITIONING_CONFIG);
     usePartitionDecorator =
-        config.getBoolean(BigQuerySinkConfig.BIGQUERY_PARTITION_DECORATOR_CONFIG);
+            config.getBoolean(BigQuerySinkConfig.BIGQUERY_PARTITION_DECORATOR_CONFIG);
     if (config.getBoolean(BigQuerySinkTaskConfig.GCS_BQ_TASK_CONFIG)) {
       startGcsToBqLoadTask();
     } else if (upsertDelete) {
       mergeQueries =
-          new MergeQueries(config, mergeBatches, executor, getBigQuery(), getSchemaManager(), context);
+              new MergeQueries(config, mergeBatches, executor, getBigQuery(), getSchemaManager(), context);
       maybeStartMergeFlushTask();
     } else if (useStorageApi) {
       initializeStorageApiMode();
@@ -633,13 +648,14 @@ public class BigQuerySinkTask extends SinkTask {
       BigQueryWriteSettings writeSettings = new GcpClientBuilder.BigQueryWriteSettingsBuilder().withConfig(config).build();
       if (useStorageApiBatchMode) {
         StorageWriteApiBatchApplicationStream writer = new StorageWriteApiBatchApplicationStream(
-            retry,
-            retryWait,
-            writeSettings,
-            autoCreateTables,
-            errantRecordHandler,
-            getSchemaManager(),
-            attemptSchemaUpdate
+                retry,
+                retryWait,
+                writeSettings,
+                autoCreateTables,
+                errantRecordHandler,
+                getSchemaManager(),
+                attemptSchemaUpdate,
+                executor
         );
         storageApiWriter = writer;
 
@@ -653,15 +669,19 @@ public class BigQuerySinkTask extends SinkTask {
       } else {
         logger.info("Starting task with Storage Write API Default Stream");
         storageApiWriter = new StorageWriteApiDefaultStream(
-            retry,
-            retryWait,
-            writeSettings,
-            autoCreateTables,
-            errantRecordHandler,
-            getSchemaManager(),
-            attemptSchemaUpdate
+                retry,
+                retryWait,
+                writeSettings,
+                autoCreateTables,
+                errantRecordHandler,
+                getSchemaManager(),
+                attemptSchemaUpdate,
+                executor
         );
+
+
       }
+      storageWriteApiWriter = new StorageWriteApiWriter(storageApiWriter, executor);
     }
   }
 
@@ -677,9 +697,12 @@ public class BigQuerySinkTask extends SinkTask {
 
   private void maybeThrowErrors() {
     executor.maybeThrowEncounteredError();
+
+
+
     if (useStorageApiBatchMode && loadExecutor.isTerminated()) {
       throw new BigQueryStorageWriteApiConnectException(
-          "Batch load handler is terminated, failing task as no data would be written to bigquery tables!");
+              "Batch load handler is terminated, failing task as no data would be written to bigquery tables!");
     }
   }
 
@@ -698,9 +721,9 @@ public class BigQuerySinkTask extends SinkTask {
         bucket = gcs.create(bucketInfo);
       } else {
         throw new ConnectException(String.format(
-            "Bucket '%s' does not exist; Create the bucket manually, or set '%s' to true",
-            bucketName,
-            BigQuerySinkConfig.AUTO_CREATE_BUCKET_CONFIG
+                "Bucket '%s' does not exist; Create the bucket manually, or set '%s' to true",
+                bucketName,
+                BigQuerySinkConfig.AUTO_CREATE_BUCKET_CONFIG
         ));
       }
     }
@@ -719,12 +742,17 @@ public class BigQuerySinkTask extends SinkTask {
     logger.info("Attempting to start upsert/delete load executor");
     loadExecutor = Executors.newScheduledThreadPool(1, new MdcContextThreadFactory());
     loadExecutor.scheduleAtFixedRate(
-        mergeQueries::mergeFlushAll, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+            mergeQueries::mergeFlushAll, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
   }
 
   @Override
   public void stop() {
     try {
+      try {
+        storageWriteApiWriter.stopDrainer();
+      } catch (Exception e) {
+        logger.warn("Failed to shut down drainer thread", e);
+      }
       maybeStopExecutor(loadExecutor, "load executor");
       maybeStopExecutor(executor, "table write executor");
       if (upsertDelete) {
@@ -778,6 +806,7 @@ public class BigQuerySinkTask extends SinkTask {
   private static class MdcContextThreadFactory implements ThreadFactory {
 
     private final Map<String, String> mdcContext;
+    private final AtomicInteger idx = new AtomicInteger(1);
 
     public MdcContextThreadFactory() {
       this.mdcContext = MDC.getCopyOfContextMap();
@@ -785,16 +814,21 @@ public class BigQuerySinkTask extends SinkTask {
 
     @Override
     public Thread newThread(Runnable runnable) {
+      String name = "t-" + idx.getAndIncrement();
+      Thread t;
       if (mdcContext == null) {
-        return new Thread(runnable);
+        t = new Thread(runnable, name);
       } else {
-        return new Thread(() -> {
+        t = new Thread(() -> {
           MDC.setContextMap(mdcContext);
           runnable.run();
-        });
+        }, name);
       }
+      return t;
     }
   }
+
+
 
   private class TopicPartitionManager {
 

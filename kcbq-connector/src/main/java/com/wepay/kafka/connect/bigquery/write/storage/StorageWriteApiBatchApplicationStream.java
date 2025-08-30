@@ -32,6 +32,7 @@ import com.google.protobuf.Descriptors;
 import com.wepay.kafka.connect.bigquery.ErrantRecordHandler;
 import com.wepay.kafka.connect.bigquery.SchemaManager;
 import com.wepay.kafka.connect.bigquery.exception.BigQueryStorageWriteApiConnectException;
+import com.wepay.kafka.connect.bigquery.write.batch.KcbqThreadPoolExecutor;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -80,21 +81,23 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
   protected ConcurrentMap<ApplicationStream, Object> streamLocks;
 
   public StorageWriteApiBatchApplicationStream(
-      int retry,
-      long retryWait,
-      BigQueryWriteSettings writeSettings,
-      boolean autoCreateTables,
-      ErrantRecordHandler errantRecordHandler,
-      SchemaManager schemaManager,
-      boolean attemptSchemaUpdate) {
+          int retry,
+          long retryWait,
+          BigQueryWriteSettings writeSettings,
+          boolean autoCreateTables,
+          ErrantRecordHandler errantRecordHandler,
+          SchemaManager schemaManager,
+          boolean attemptSchemaUpdate,
+          KcbqThreadPoolExecutor executor) {
     super(
-        retry,
-        retryWait,
-        writeSettings,
-        autoCreateTables,
-        errantRecordHandler,
-        schemaManager,
-        attemptSchemaUpdate
+            retry,
+            retryWait,
+            writeSettings,
+            autoCreateTables,
+            errantRecordHandler,
+            schemaManager,
+            attemptSchemaUpdate,
+            executor
     );
     streams = new ConcurrentHashMap<>();
     currentStreams = new ConcurrentHashMap<>();
@@ -109,17 +112,17 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
   public void preShutdown() {
     logger.debug("Shutting down all streams on all tables as due to task shutdown!!!");
     this.streams.values()
-        .stream().flatMap(item -> item.values().stream())
-        .collect(Collectors.toList())
-        .forEach(ApplicationStream::closeStream);
+            .stream().flatMap(item -> item.values().stream())
+            .collect(Collectors.toList())
+            .forEach(ApplicationStream::closeStream);
     logger.debug("Shutting completed for all streams on all tables!");
   }
 
   @Override
   protected StreamWriter streamWriter(
-      TableName tableName,
-      String streamName,
-      List<ConvertedRecord> records
+          TableName tableName,
+          String streamName,
+          List<ConvertedRecord> records
   ) {
     ApplicationStream applicationStream = this.streams.get(tableName.toString()).get(streamName);
     applicationStream.increaseAppendCall();
@@ -144,13 +147,13 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
               ApplicationStream applicationStream = applicationStreamEntry.getValue();
               String streamName = applicationStreamEntry.getKey();
               if (applicationStream.isInactive()) {
-                logger.trace("Ignoring inactive stream {} at index {}", streamName, i);
+                logger.info("Ignoring inactive stream {} at index {}", streamName, i);
               } else if (applicationStream.isReadyForOffsetCommit()) {
-                logger.trace("Pulling offsets from committed stream {} at index {} ", streamName, i);
+                logger.info("Pulling offsets from committed stream {} at index {} ", streamName, i);
                 offsetsReadyForCommits.putAll(applicationStream.getOffsetInformation());
                 applicationStream.markInactive();
               } else {
-                logger.trace("Ignoring all streams as stream {} at index {} is not yet committed", streamName, i);
+                logger.info("Ignoring all streams as stream {} at index {} is not yet committed", streamName, i);
                 // We move sequentially for offset commit, until current offsets are ready, we cannot commit next.
                 break;
               }
@@ -177,7 +180,7 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
   public boolean maybeCreateStream(String tableName, List<ConvertedRecord> rows) {
     String streamName = this.currentStreams.get(tableName);
     boolean shouldCreateNewStream = (streamName == null)
-        || (this.streams.get(tableName).get(streamName) != null
+            || (this.streams.get(tableName).get(streamName) != null
             && this.streams.get(tableName).get(streamName).canTransitionToNonActive());
     if (shouldCreateNewStream) {
       logger.trace("Attempting to create new stream on table {}", tableName);
@@ -215,8 +218,8 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
    * @return Stream name using which offsets would be written
    */
   public String updateOffsetsOnStream(
-      String tableName,
-      List<ConvertedRecord> rows
+          String tableName,
+          List<ConvertedRecord> rows
   ) {
     String streamName;
     Map<TopicPartition, OffsetAndMetadata> offsetInfo = getOffsetFromRecords(rows);
@@ -224,6 +227,7 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
       streamName = this.getCurrentStreamForTable(tableName, rows);
       this.streams.get(tableName).get(streamName).updateOffsetInformation(offsetInfo, rows.size());
     }
+    logger.info("Assigned offsets {} to stream {} for {} rows", offsetInfo, streamName, rows.size());
     logger.trace("Assigned offsets {} to stream {} for {} rows", offsetInfo, streamName, rows.size());
     return streamName;
   }
@@ -234,15 +238,15 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
   @VisibleForTesting
   ApplicationStream createApplicationStream(String tableName, List<ConvertedRecord> rows) {
     StorageWriteApiRetryHandler retryHandler = new StorageWriteApiRetryHandler(
-        TableName.parse(tableName), rows != null ? getSinkRecords(rows) : null, retry, retryWait, time);
+            TableName.parse(tableName), rows != null ? getSinkRecords(rows) : null, retry, retryWait, time);
     do {
       try {
         return new ApplicationStream(tableName, getWriteClient(), jsonWriterFactory);
       } catch (Exception e) {
         String baseErrorMessage = String.format(
-            "Failed to create Application stream writer on table %s due to %s",
-            tableName,
-            e.getMessage());
+                "Failed to create Application stream writer on table %s due to %s",
+                tableName,
+                e.getMessage());
         retryHandler.setMostRecentException(new BigQueryStorageWriteApiConnectException(baseErrorMessage, e));
         if (shouldHandleTableCreation(e.getMessage())) {
           if (rows == null) {
@@ -284,7 +288,7 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
         } else {
           // We should never reach here
           throw new BigQueryStorageWriteApiConnectException(
-              "Application Stream creation could not be completed successfully.");
+                  "Application Stream creation could not be completed successfully.");
         }
 
       }
@@ -333,27 +337,28 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
    */
   private void commitStreamIfEligible(String tableName, String streamName) {
     if (!Objects.equals(currentStreams.get(tableName), streamName)) {
-      logger.trace("Stream {} is not active, can be committed", streamName);
+      logger.info("Stream {} is not active, can be committed", streamName);
       ApplicationStream stream = this.streams.get(tableName).get(streamName);
       synchronized (lock(stream)) {
         if (stream != null && stream.areAllExpectedCallsCompleted()) {
           if (!stream.canBeCommitted()) {
-            logger.trace("Stream {} with state {} is not committable", streamName, stream.getCurrentState());
+            logger.info("Stream {} with state {} is not committable", streamName, stream.getCurrentState());
             return;
           }
           // We are done with all expected calls for non-active streams, lets finalise and commit the stream.
-          logger.trace("Stream {} has written all assigned offsets.", streamName);
+          logger.info("Stream {} has written all assigned offsets.", streamName);
           finaliseAndCommitStream(stream);
-          logger.trace("Stream {} is now committed.", streamName);
+          logger.info("Stream {} is now committed.", streamName);
           return;
         }
       }
-      logger.trace("Stream {} has not written all assigned offsets.", streamName);
+      logger.info("Stream {} has not written all assigned offsets.", streamName);
     }
-    logger.trace("Stream {} on table {} is not eligible for commit yet", streamName, tableName);
+    logger.info("Stream {} on table {} is not eligible for commit yet", streamName, tableName);
   }
 
   private void updateSuccessAndTryCommit(ApplicationStream applicationStream, TableName tableName, String streamName) {
+    logger.info("updating success and trying to commit");
     applicationStream.increaseCompletedCalls();
     commitStreamIfEligible(tableName.toString(), streamName);
   }
@@ -396,7 +401,7 @@ public class StorageWriteApiBatchApplicationStream extends StorageWriteApiBase {
 
     @Override
     public ApiFuture<AppendRowsResponse> appendRows(
-        JSONArray rows
+            JSONArray rows
     ) throws Descriptors.DescriptorValidationException, IOException {
       return applicationStream.writer().append(rows);
     }
